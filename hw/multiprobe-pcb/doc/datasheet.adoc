@@ -1,0 +1,92 @@
+= MultiProbe Pico Debugger
+
+== General Description
+A debug probe for the RP2040 & RP2350 devices that can debug up to 4 devices at the same time with two active UARTs.
+
+== Key features
+** Debug multiple picos using a single debugger over a single USB cable.
+** Connect to each uart from a single USB (2 active limit at the moment).
+** Indicator LED for active SWD probes and activated UARTS.
+
+== Required software
+** Linux operating system
+** VSCode with the Raspberry Pi Pico extension
+
+== Software documentation
+
+By default DEBUG 1 should work out the box like the official debugprobe. To target the other debug ports, an openOCD command must be set eg. "cmsis-dap usb interface 1" for DEBUG 2. For the latest documentation and UART setup please see the github project readme ( https://github.com/picolemon/multiprobe ).
+
+== Applications
+** Device debugging
+
+== Pinout
+=== DEBUG 1-4 SWD Connector
+[cols="1,1,8"]
+|===
+|Pin |Pin name |Description
+|1 |SWDIO |SWD data
+|2 |GND |Ground
+|3 |SWDCLK |SWD clock
+|=== 
+
+=== UART 1-4 Connector
+[cols="1,1,8"]
+|===
+|Pin |Pin name |Description
+|1 |GND |Ground
+|2 |TX |UART Transmit pin (out)
+|3 |RX |UART Receive pin (in)
+|=== 
+
+=== PWROUT Connector
+[cols="1,1,8"]
+|===
+|Pin |Pin name |Description
+|1 |5V |USB VBUS 5V output
+|2 |GND |Ground
+|3 |RX |3V power output of the ME6217C33M5G DC to DC converter ( Low power output, don't use to power any external device )
+|=== 
+
+=== Host interface
+USB-C compatible
+
+=== Buttons
+[cols="1,8"]
+|===
+|Btn |Description
+|BOOT |Flash device, hold down during powerup or post reset to run the UF2.Bootloader
+|RESET |Hardware reset device
+|=== 
+
+
+=== SWD Header (Unpopulated)
+[cols="1,1,8"]
+Unpolulated SWD interface to debug the onboard RP2350, used for debugger development so ignore for general use.
+|===
+|Pin |Pin name |Description
+|1 |SWDIO |SWD data
+|2 |GND |Ground
+|3 |SWDCLK |SWD clock
+|=== 
+
+
+=== UART Header (Unpopulated)
+Unpolulated UART interface to debug the onboard RP2350, used for debugger development so ignore for general use.
+[cols="1,1,8"]
+|===
+|Pin |Pin name |Description
+|1 |TX |UART Transmit pin (out)
+|2 |GND |Ground
+|3 |RX |UART Receive pin (in)
+|=== 
+
+== Links
+
+Github: https://github.com/picolemon/multiprobe
+
+
+== Change history
+01-10-25:   Initial version.
+
+== Contact & support
+hello@picolemon.com
