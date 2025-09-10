@@ -1,4 +1,4 @@
-# MultiProbe Pico Debugger:lemon: # 
+# MultiProbe Pico Debugger :lemon:
 [![datasheet (pdf)](https://img.shields.io/badge/Data%20Sheet-PDF-f3cd5a?longCache=true&style=flat-rounded)](https://github.com/picolemon/multiprobe/blob/main/hw/multiprobe-pcb/doc/datasheet.pdf)
 [![sch (pdf)](https://img.shields.io/badge/SCH-PDF-f3cd5a?longCache=true&style=flat-rounded)](https://github.com/picolemon/picofabric-hardware/blob/main/hw/multiprobe-pcb/doc/multiprobe-pcb.pdf)
 [![Tindie](https://img.shields.io/badge/Tindie-Buy-f3cd5a?longCache=true&style=flat-rounded)](https://www.tindie.com/products/picolemon/multiprobe-pico-debugger/)
