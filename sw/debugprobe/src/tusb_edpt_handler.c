@@ -30,7 +30,15 @@ void dap_edpt_init(void) {
 	{
 		struct DAPEndpointState* state = &ep_states[i];
 		state->itf_num = 0;
-		state->probeId = i;		
+		state->probeId = i;
+		/* Fix #15: create the ring mutex exactly once. dap_edpt_init is the
+		 * tinyUSB class-driver init hook, invoked from tusb_init() in main()
+		 * BEFORE vTaskStartScheduler(). xSemaphoreCreateMutex is safe to call
+		 * pre-scheduler (it only allocates from the heap and initialises the
+		 * queue struct). Guard against a second init pass (re-enumeration)
+		 * leaking a mutex by only creating when NULL. */
+		if (state->ring_mutex == NULL)
+			state->ring_mutex = xSemaphoreCreateMutex();
 	}
 }
 
@@ -166,6 +174,13 @@ bool dap_edpt_xfer_cb(uint8_t __unused rhport, uint8_t ep_addr, xfer_result_t re
 	{
 		if(xferred_bytes >= 0u && xferred_bytes <= DAP_PACKET_SIZE)
 		{
+			/* Fix #15: serialise ring-index updates and the usbd_edpt_xfer
+			 * re-arm against the producer in dap_thread. Skip the lock if
+			 * ring_mutex hasn't been created yet (shouldn't happen --
+			 * dap_edpt_init runs before the scheduler) to stay NULL-safe. */
+			if (state->ring_mutex != NULL)
+				xSemaphoreTake(state->ring_mutex, portMAX_DELAY);
+
 			state->USBResponseBuffer.rptr++;
 
 			// This checks that the buffer was not empty in DAP thread, which means the next buffer was not queued up for the in endpoint callback
@@ -179,8 +194,17 @@ bool dap_edpt_xfer_cb(uint8_t __unused rhport, uint8_t ep_addr, xfer_result_t re
 				state->USBResponseBuffer.wasEmpty = (state->USBResponseBuffer.rptr + 1) == state->USBResponseBuffer.wptr;
 			}
 
-			//  Wake up DAP thread after processing the callback
-			xTaskNotifyGive(state->dap_taskhandle);
+			if (state->ring_mutex != NULL)
+				xSemaphoreGive(state->ring_mutex);
+
+			/* Fix #11c: dap_taskhandle can be NULL between tud_unmount_cb
+			 * (sets should_exit) and the next tud_mount_cb. xTaskNotifyGive(NULL)
+			 * trips configASSERT, so just drop the notify if the task is gone.
+			 * Fix #15: notify outside the mutex -- task notifications don't
+			 * need ring_mutex and keeping them outside shortens the critical
+			 * section. */
+			if (state->dap_taskhandle != NULL)
+				xTaskNotifyGive(state->dap_taskhandle);
 			return true;
 		}
 
@@ -190,6 +214,12 @@ bool dap_edpt_xfer_cb(uint8_t __unused rhport, uint8_t ep_addr, xfer_result_t re
 
 		if(xferred_bytes >= 0u && xferred_bytes <= DAP_PACKET_SIZE)
 		{
+			/* Fix #15: serialise against dap_thread, which also reads
+			 * wasFull and bumps wptr / re-arms the OUT xfer when it drains
+			 * a full buffer. */
+			if (state->ring_mutex != NULL)
+				xSemaphoreTake(state->ring_mutex, portMAX_DELAY);
+
 			// Only queue the next buffer in the out callback if the buffer is not full
 			// If full, we set the wasFull flag, which will be checked by dap thread
 			if(!buffer_full(&state->USBRequestBuffer))
@@ -202,8 +232,13 @@ bool dap_edpt_xfer_cb(uint8_t __unused rhport, uint8_t ep_addr, xfer_result_t re
 				state->USBRequestBuffer.wasFull = true;
 			}
 
-			//  Wake up DAP thread after processing the callback
-			xTaskNotifyGive(state->dap_taskhandle);
+			if (state->ring_mutex != NULL)
+				xSemaphoreGive(state->ring_mutex);
+
+			/* Fix #11c: see note above; guard against NULL handle.
+			 * Fix #15: notify outside the mutex. */
+			if (state->dap_taskhandle != NULL)
+				xTaskNotifyGive(state->dap_taskhandle);
 			return true;
 		}
 
@@ -218,6 +253,18 @@ void dap_thread(void *ptr)
 	uint32_t n;
 	do
 	{
+		/* Fix #11a: cooperative exit. tud_unmount_cb sets should_exit and
+		 * notifies us; at the top of the outer loop we own no mutexes and
+		 * the scheduler is not suspended, so it is safe to self-delete.
+		 * Self-delete (vs vTaskDelete from another task) ensures any
+		 * mutexes/scheduler-suspends taken inside the inner block have
+		 * already been released by us. */
+		if (state->should_exit)
+		{
+			state->dap_taskhandle = NULL;
+			vTaskDelete(NULL);
+			/* unreachable */
+		}
 		while(state->USBRequestBuffer.rptr != state->USBRequestBuffer.wptr)
 		{
 			/*
@@ -247,11 +294,19 @@ void dap_thread(void *ptr)
 			// If the buffer was full in the out callback, we need to queue up another buffer for the endpoint to consume, now that we know there is space in the buffer.
 			if(state->USBRequestBuffer.wasFull)
 			{
-				vTaskSuspendAll(); // Suspend the scheduler to safely update the write index
+				/* Fix #15: use the per-state ring_mutex instead of
+				 * vTaskSuspendAll/xTaskResumeAll. usbd_edpt_xfer internally
+				 * takes osal mutexes, and FreeRTOS forbids mutex acquisition
+				 * while the scheduler is suspended. The mutex provides the
+				 * same mutual exclusion against the OUT xfer_cb without that
+				 * illegality. */
+				if (state->ring_mutex != NULL)
+					xSemaphoreTake(state->ring_mutex, portMAX_DELAY);
 				state->USBRequestBuffer.wptr++;
 				usbd_edpt_xfer(state->_rhport, state->_out_ep_addr, WR_SLOT_PTR(state->USBRequestBuffer), DAP_PACKET_SIZE);
 				state->USBRequestBuffer.wasFull = false;
-				xTaskResumeAll();
+				if (state->ring_mutex != NULL)
+					xSemaphoreGive(state->ring_mutex);
 			}
 
 			uint32_t resp_len = DAP_ExecuteCommand(state->probeId, state->DAPRequestBuffer, state->DAPResponseBuffer);
@@ -260,8 +315,14 @@ void dap_thread(void *ptr)
 					dap_cmd_string[DAPResponseBuffer[0]]);*/
 
 
-			//  Suspend the scheduler to avoid stale values/race conditions between threads
-			vTaskSuspendAll();
+			/* Fix #15: per-state ring_mutex replaces vTaskSuspendAll. See
+			 * the matching comment on the wasFull branch above and the
+			 * mutex creation in dap_edpt_init for the full rationale --
+			 * usbd_edpt_xfer takes osal mutexes internally and cannot be
+			 * called with the scheduler suspended. The mutex serialises
+			 * this producer block against the IN xfer_cb consumer block. */
+			if (state->ring_mutex != NULL)
+				xSemaphoreTake(state->ring_mutex, portMAX_DELAY);
 
 			// Compute the slot index BEFORE bumping wptr so the IN-callback consumer
 			// can read the matching length from resp_lens[] for the slot it is sending.
@@ -281,7 +342,8 @@ void dap_thread(void *ptr)
 				// The In callback needs to check this flag to know when to queue up the next buffer.
 				state->USBResponseBuffer.wasEmpty = false;
 			}
-			xTaskResumeAll();
+			if (state->ring_mutex != NULL)
+				xSemaphoreGive(state->ring_mutex);
 		}
 
 		// Suspend DAP thread until it is awoken by a USB thread callback
@@ -329,10 +391,15 @@ DAPEndpointState* getEndpointStateByEndpointAddr(uint8_t ep_addr)
 	for(int i=0;i<MAX_DAP_PROBES;i++)
 	{
 		struct DAPEndpointState* state = &ep_states[i];
+		/* Fix #11c: tud_unmount_cb zeros _out_ep_addr/_in_ep_addr so a
+		 * stale xfer_cb after teardown cannot accidentally match against
+		 * a torn-down state. Both being zero means "not open". */
+		if(state->_out_ep_addr == 0 && state->_in_ep_addr == 0)
+			continue;
 		if(state->_out_ep_addr == ep_addr)
 			return state;
 		if(state->_in_ep_addr == ep_addr)
-			return state;		
+			return state;
 	}
 	return 0;
 }

@@ -12,6 +12,9 @@
 #include "device/usbd_pvt.h"
 #include "DAP_config.h"
 
+#include "FreeRTOS.h"
+#include "semphr.h"
+
 #define DAP_INTERFACE_SUBCLASS 0x00
 #define DAP_INTERFACE_PROTOCOL 0x00
 
@@ -44,6 +47,23 @@ typedef struct DAPEndpointState
 	uint8_t DAPResponseBuffer[DAP_PACKET_SIZE];
 
 	TaskHandle_t dap_taskhandle;
+
+	/* Fix #11a: cooperative-exit flag. tud_unmount_cb sets this and notifies
+	 * the task; dap_thread observes it at the top of its outer loop and
+	 * self-deletes after clearing dap_taskhandle. Self-delete avoids leaking
+	 * pio_mutex or the scheduler-suspend counter that vTaskDelete from
+	 * another task would otherwise leave behind. */
+	volatile bool should_exit;
+
+	/* Fix #15: per-state mutex serializing producer (dap_thread) and
+	 * consumers (IN/OUT xfer_cb directions) against the ring-buffer
+	 * indices and the usbd_edpt_xfer kick. Replaces the previous
+	 * vTaskSuspendAll/xTaskResumeAll brackets in dap_thread, which were
+	 * illegal: tinyUSB's usbd_edpt_xfer internally takes osal mutexes,
+	 * and FreeRTOS forbids any mutex acquisition while the scheduler is
+	 * suspended. Created once in dap_edpt_init (before the scheduler
+	 * starts) and never destroyed. */
+	SemaphoreHandle_t ring_mutex;
 } DAPEndpointState;
 
 extern DAPEndpointState ep_states[MAX_DAP_PROBES];

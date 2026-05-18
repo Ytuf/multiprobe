@@ -193,6 +193,18 @@ void probe_init(uint32_t probeId) {
         // probe sharing this PIO instance.
         SemaphoreHandle_t mutex = pio_mutex[pio_get_index(probes[probeId].pio)];
         if (mutex) xSemaphoreTake(mutex, portMAX_DELAY);
+        // Fix #14: pio_add_program returns -1 (as uint) when PIO instruction
+        // memory is exhausted. Pre-check under the mutex so check-then-add is
+        // atomic against a concurrent pio_remove_program on the same PIO. If
+        // allocation would fail, release the mutex and leave initted=0 so the
+        // caller sees this probe as un-inited rather than driving PIO at a
+        // garbage 0xFFFFFFFF instruction address.
+        if (!pio_can_add_program(probes[probeId].pio, &probe_program)) {
+            if (mutex) xSemaphoreGive(mutex);
+            probe_info("probe_init: PIO%d instruction memory exhausted, probe %d not initted\n",
+                       pio_get_index(probes[probeId].pio), probeId);
+            return;
+        }
         uint offset = pio_add_program(probes[probeId].pio, &probe_program);
         if (mutex) xSemaphoreGive(mutex);
         probes[probeId].offset = offset;

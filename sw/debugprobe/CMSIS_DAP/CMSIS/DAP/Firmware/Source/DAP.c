@@ -56,6 +56,19 @@
 DAP_Data_t DAP_Data[PROBE_DAP_COUNT];           // DAP Data
 volatile uint8_t    DAP_TransferAbort[PROBE_DAP_COUNT];  // Transfer Abort Flag
 
+// Fix #13: Per-batch absolute response-buffer end. DAP_ExecuteCommand sets this
+// to (DAPResponseBuffer + DAP_PACKET_SIZE) before dispatching, so the transfer
+// helpers can clamp their per-iteration response_limit against the true end of
+// the global buffer rather than against (response_head + DAP_PACKET_SIZE)
+// computed from a partial offset within it. Without this clamp, a chain of
+// sub-commands inside ID_DAP_ExecuteCommands can cumulatively overflow the
+// 64-byte DAPResponseBuffer slot, corrupting the next ring slot and producing
+// a USB transfer larger than DAP_PACKET_SIZE that breaks CMSIS-DAP framing.
+// This is per-batch, not per-sub-call: each sub-call still sees its own
+// (response_head + DAP_PACKET_SIZE) per-iteration headroom, but the per-batch
+// ceiling additionally bounds the cumulative response.
+static uint8_t     *DAPResponseLimit[PROBE_DAP_COUNT];
+
 
 static const char DAP_FW_Ver [] = DAP_FW_VER;
 
@@ -679,6 +692,12 @@ static uint32_t DAP_SWD_Transfer(uint32_t probeId, const uint8_t *request, uint8
   response_value = 0U;
   response_head  = response;
   response_limit = response_head + DAP_PACKET_SIZE;
+  // Fix #13: Clamp against the per-batch absolute end so chained sub-commands
+  // inside ID_DAP_ExecuteCommands cannot cumulatively overflow the global
+  // DAPResponseBuffer. DAPResponseLimit is set by DAP_ExecuteCommand.
+  if (DAPResponseLimit[probeId] != NULL && DAPResponseLimit[probeId] < response_limit) {
+    response_limit = DAPResponseLimit[probeId];
+  }
   response      += 2;
 
   DAP_TransferAbort[probeId] = 0U;
@@ -971,6 +990,10 @@ static uint32_t DAP_JTAG_Transfer(uint32_t probeId, const uint8_t *request, uint
   response_value = 0U;
   response_head  = response;
   response_limit = response_head + DAP_PACKET_SIZE;
+  // Fix #13: see DAP_SWD_Transfer for the rationale.
+  if (DAPResponseLimit[probeId] != NULL && DAPResponseLimit[probeId] < response_limit) {
+    response_limit = DAPResponseLimit[probeId];
+  }
   response      += 2;
 
   DAP_TransferAbort[probeId] = 0U;
@@ -1309,6 +1332,10 @@ static uint32_t DAP_SWD_TransferBlock(uint32_t probeId, const uint8_t *request, 
   response_value = 0U;
   response_head  = response;
   response_limit = response_head + DAP_PACKET_SIZE;
+  // Fix #13: see DAP_SWD_Transfer for the rationale.
+  if (DAPResponseLimit[probeId] != NULL && DAPResponseLimit[probeId] < response_limit) {
+    response_limit = DAPResponseLimit[probeId];
+  }
   response      += 3;
 
   DAP_TransferAbort[probeId] = 0U;
@@ -1416,13 +1443,17 @@ static uint32_t DAP_JTAG_TransferBlock(uint32_t probeId, const uint8_t *request,
   response_value = 0U;
   response_head  = response;
   response_limit = response_head + DAP_PACKET_SIZE;
+  // Fix #13: see DAP_SWD_Transfer for the rationale.
+  if (DAPResponseLimit[probeId] != NULL && DAPResponseLimit[probeId] < response_limit) {
+    response_limit = DAPResponseLimit[probeId];
+  }
   response      += 3;
 
   DAP_TransferAbort[probeId] = 0U;
 
   // Device index (JTAP TAP)
   DAP_Data[probeId].jtag_dev.index = *request++;
-  if (DAP_Data[probeId].jtag_dev.index >= DAP_Data[probeId].jtag_dev.count) { 
+  if (DAP_Data[probeId].jtag_dev.index >= DAP_Data[probeId].jtag_dev.count) {
     goto end;
   }
 
@@ -1732,6 +1763,22 @@ uint32_t DAP_ProcessCommand(uint32_t probeId, const uint8_t *request, uint8_t *r
       num = DAP_WriteAbort(probeId, request, response);
       break;
 
+    // Fix #14: ID_DAP_TransferAbort was previously unhandled and fell through
+    // to default -> ID_DAP_Invalid. The CMSIS-DAP spec requires this command
+    // to be acknowledged. True preemption requires out-of-band handling (the
+    // host normally sends Abort on a different USB transfer while a transfer
+    // is in flight). This firmware processes all commands through a single
+    // per-probe dap_thread queue, so by the time we run this case any prior
+    // transfer has already completed -- setting the flag is best-effort and
+    // will only have an effect on a transfer that happens to start between
+    // now and the next time the flag is cleared at the top of a transfer
+    // loop. Returning DAP_OK is at least protocol-compliant.
+    case ID_DAP_TransferAbort:
+      DAP_TransferAbort[probeId] = 1U;
+      *response = DAP_OK;
+      num = 1U;
+      break;
+
 #if ((SWO_UART != 0) || (SWO_MANCHESTER != 0))
     case ID_DAP_SWO_Transport:
       num = SWO_Transport(request, response);
@@ -1772,6 +1819,11 @@ uint32_t DAP_ProcessCommand(uint32_t probeId, const uint8_t *request, uint8_t *r
 //             number of bytes in request (upper 16 bits)
 uint32_t DAP_ExecuteCommand(uint32_t probeId, const uint8_t *request, uint8_t *response) {
   uint32_t cnt, num, n;
+  // Fix #13: Establish the absolute per-batch response-buffer ceiling so the
+  // transfer helpers can clamp their per-iteration response_limit. The caller
+  // (tusb_edpt_handler.c) always hands us a DAP_PACKET_SIZE-byte buffer.
+  uint8_t *const response_end = response + DAP_PACKET_SIZE;
+  DAPResponseLimit[probeId] = response_end;
 
   if (*request == ID_DAP_ExecuteCommands) {
     *response++ = *request++;
@@ -1779,10 +1831,19 @@ uint32_t DAP_ExecuteCommand(uint32_t probeId, const uint8_t *request, uint8_t *r
     *response++ = (uint8_t)cnt;
     num = (2U << 16) | 2U;
     while (cnt--) {
+      // Fix #13: Stop chaining if we cannot guarantee at least one more
+      // sub-command's minimum response (1 echo byte + 1 status byte = 2).
+      // Each sub-command's per-iteration bounds check (response + 16 > limit
+      // for Transfer, response + 4 > limit for TransferBlock) handles its
+      // own per-iteration bound; this outer check prevents a sub-command
+      // from being dispatched with no headroom at all.
+      if ((response + 2U) > response_end) {
+        break;
+      }
       n = DAP_ProcessCommand(probeId, request, response);
       num += n;
       request  += (uint16_t)(n >> 16);
-      response += (uint16_t) n;  
+      response += (uint16_t) n;
     }
     return (num);
   }

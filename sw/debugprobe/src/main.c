@@ -233,9 +233,10 @@ void tud_suspend_cb(bool remote_wakeup_en)
   probe_info("Suspended\n");
   /* Were we actually configured? If not, threads don't exist */
   if (was_configured) {
+    /* Fix #11b: guard suspend with non-NULL handle. */
     for(int i=0;i<MAX_UART_DEVICES;i++)
     {
-      if(uartDevices[i].isConfigured)
+      if(uartDevices[i].isConfigured && uartDevices[i].uart_taskHandle != NULL)
   	    vTaskSuspend(uartDevices[i].uart_taskHandle);
     }
     /* Fix #1: suspend each per-probe dap_thread (handles live in ep_states), not a NULL global. */
@@ -253,9 +254,10 @@ void tud_resume_cb(void)
 {
   probe_info("Resumed\n");
   if (was_configured) {
+    /* Fix #11b: guard resume with non-NULL handle. */
     for(int i=0;i<MAX_UART_DEVICES;i++)
     {
-      if(uartDevices[i].isConfigured)
+      if(uartDevices[i].isConfigured && uartDevices[i].uart_taskHandle != NULL)
   	    vTaskResume(uartDevices[i].uart_taskHandle);
     }
     /* Fix #1: resume each per-probe dap_thread, not a NULL global. */
@@ -271,31 +273,41 @@ void tud_resume_cb(void)
 void tud_unmount_cb(void)
 {
   probe_info("Disconnected\n");
+  /* Fix #11b: guard UART suspend with non-NULL handle so a repeat unmount
+   * (without an intervening mount) doesn't suspend a stale handle. */
   for(int i=0;i<MAX_UART_DEVICES;i++)
   {
-    if(uartDevices[i].isConfigured)
+    if(uartDevices[i].isConfigured && uartDevices[i].uart_taskHandle != NULL)
       vTaskSuspend(uartDevices[i].uart_taskHandle);
   }
-  /* Fix #1: suspend then delete each per-probe dap_thread; clear handles so tud_mount_cb can recreate. */
-  for(int i=0;i<MAX_DAP_PROBES;i++)
-  {
-    DAPEndpointState* state = getEndpointStateByIndex(i);
-    if(state->dap_taskhandle != NULL)
-      vTaskSuspend(state->dap_taskhandle);
-  }
+  /* Fix #11a: do NOT vTaskSuspend dap_thread here. Suspending mid-critical-
+   * section would freeze the task while it still owns pio_mutex or the
+   * scheduler-suspend counter. Instead we set should_exit and let the task
+   * self-delete at the top of its outer loop where it owns nothing. */
+  /* Fix #11b: null-and-clear UART handles to match the dap-side pattern. */
   for(int i=0;i<MAX_UART_DEVICES;i++)
   {
-    if(uartDevices[i].isConfigured)
+    if(uartDevices[i].isConfigured && uartDevices[i].uart_taskHandle != NULL)
+    {
       vTaskDelete(uartDevices[i].uart_taskHandle);
+      uartDevices[i].uart_taskHandle = NULL;
+    }
   }
+  /* Fix #11a: cooperative-exit pattern. Signal each dap_thread to self-
+   * delete and wake it so it observes the flag promptly. The task itself
+   * clears state->dap_taskhandle to NULL before vTaskDelete(NULL).
+   * Fix #11c: zero the endpoint addresses so a stale xfer_cb after teardown
+   * cannot resolve to this state (see getEndpointStateByEndpointAddr). */
   for(int i=0;i<MAX_DAP_PROBES;i++)
   {
     DAPEndpointState* state = getEndpointStateByIndex(i);
     if(state->dap_taskhandle != NULL)
     {
-      vTaskDelete(state->dap_taskhandle);
-      state->dap_taskhandle = NULL;
+      state->should_exit = true;
+      xTaskNotifyGive(state->dap_taskhandle);
     }
+    state->_in_ep_addr = 0;
+    state->_out_ep_addr = 0;
   }
   was_configured = 0;
 }
@@ -306,9 +318,11 @@ void tud_mount_cb(void)
   if (!was_configured) {
     /* UART needs to preempt USB as if we don't, characters get lost */
 
+    /* Fix #11b: only (re)create the UART task if no live handle exists
+     * (tud_unmount_cb clears these to NULL after vTaskDelete). */
     for(int i=0;i<MAX_UART_DEVICES;i++)
     {
-      if(uartDevices[i].isConfigured)
+      if(uartDevices[i].isConfigured && uartDevices[i].uart_taskHandle == NULL)
       {
         switch (uartDevices[i].type)
         {
@@ -323,11 +337,17 @@ void tud_mount_cb(void)
 
     /* Lowest priority thread is debug - need to shuffle buffers before we can toggle swd... */
     /* Fix #1: only create a per-probe dap_thread if one isn't already alive (tud_unmount_cb clears the handle). */
+    /* Fix #11a: clear should_exit before (re)creating, so the new task
+     * doesn't immediately self-delete on a stale flag from a prior
+     * teardown. */
     for(int i=0;i<MAX_DAP_PROBES;i++)
     {
       DAPEndpointState* state = getEndpointStateByIndex(i);
       if(state->dap_taskhandle == NULL)
+      {
+        state->should_exit = false;
         xTaskCreate(dap_thread, "DAP.x", configMINIMAL_STACK_SIZE, state, DAP_TASK_PRIO, &state->dap_taskhandle);
+      }
     }
 
     was_configured = 1;
@@ -340,7 +360,10 @@ void vApplicationTickHook (void)
 
 void vApplicationStackOverflowHook(TaskHandle_t Task, char *pcTaskName)
 {
-  panic("stack overflow (not the helpful kind) for %s\n", *pcTaskName);
+  /* Fix #11d: %s expects a const char*; *pcTaskName would pass a single
+   * char value, which the format would dereference as a pointer and crash
+   * the diagnostic itself. pcTaskName is already a char* — use it as-is. */
+  panic("stack overflow (not the helpful kind) for %s\n", pcTaskName);
 }
 
 void vApplicationMallocFailedHook(void)

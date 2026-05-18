@@ -55,8 +55,16 @@ This information includes:
 
 /// Processor Clock of the Cortex-M MCU used in the Debug Unit.
 /// This value is used to calculate the SWD/JTAG clock speed.
-/* Debugprobe actually uses kHz rather than Hz, so just lie about it here */
-#define CPU_CLOCK               125000000U      ///< Specifies the CPU Clock in Hz.
+/* Fix #12: CPU_CLOCK MUST match the actual system clock set in main.c
+ * (set_sys_clock_khz(252000, ...)). DAP_SWJ_Clock converts the host's
+ * requested kHz into an abstract delay counter using CPU_CLOCK, and
+ * MAKE_KHZ (sw_dp_pio.c) inverts that counter back into kHz to drive
+ * the PIO clock divider (probe_set_swclk_freq), which is computed
+ * against the true sysclk. If CPU_CLOCK does not match the true sysclk,
+ * the SWCLK frequency the target sees will not match what the host
+ * requested. If you change set_sys_clock_khz in main.c you MUST update
+ * this value in lockstep. */
+#define CPU_CLOCK               252000000U      ///< Specifies the CPU Clock in Hz.
 
 /// Number of processor cycles for I/O Port write operations.
 /// This value is used to calculate the SWD/JTAG clock speed that is generated with I/O
