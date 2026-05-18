@@ -56,17 +56,7 @@
 DAP_Data_t DAP_Data[PROBE_DAP_COUNT];           // DAP Data
 volatile uint8_t    DAP_TransferAbort[PROBE_DAP_COUNT];  // Transfer Abort Flag
 
-// Fix #13: Per-batch absolute response-buffer end. DAP_ExecuteCommand sets this
-// to (DAPResponseBuffer + DAP_PACKET_SIZE) before dispatching, so the transfer
-// helpers can clamp their per-iteration response_limit against the true end of
-// the global buffer rather than against (response_head + DAP_PACKET_SIZE)
-// computed from a partial offset within it. Without this clamp, a chain of
-// sub-commands inside ID_DAP_ExecuteCommands can cumulatively overflow the
-// 64-byte DAPResponseBuffer slot, corrupting the next ring slot and producing
-// a USB transfer larger than DAP_PACKET_SIZE that breaks CMSIS-DAP framing.
-// This is per-batch, not per-sub-call: each sub-call still sees its own
-// (response_head + DAP_PACKET_SIZE) per-iteration headroom, but the per-batch
-// ceiling additionally bounds the cumulative response.
+// Per-batch response-buffer end so chained ExecuteCommands can't overflow.
 static uint8_t     *DAPResponseLimit[PROBE_DAP_COUNT];
 
 
@@ -81,20 +71,10 @@ static const char TargetDeviceName   [] = TARGET_DEVICE_NAME;
 // Get DAP Information
 //   id:      info identifier
 //   info:    pointer to info data
-//   max_len: maximum number of bytes the caller's info buffer can accept
-//           (Fix #16d: prior signature wrote up to ~60 bytes for the string
-//            IDs without consulting any caller-supplied bound; in a chained
-//            ID_DAP_ExecuteCommands batch this could overrun the 64-byte
-//            DAPResponseBuffer slot. We now stage the response in a local
-//            scratch buffer and copy at most max_len bytes back. Strings
-//            stage at min(scratch, max_len) by writing the string getter
-//            into the scratch buffer first.)
+//   max_len: caller's info buffer size; writes are clamped to this
 //   return:  number of bytes written to info (always <= max_len)
 static uint8_t DAP_Info(uint8_t id, uint8_t *info, uint8_t max_len) {
   uint8_t length = 0U;
-  // Scratch buffer large enough for the worst-case DAP_Info payload (a
-  // ~60-byte CMSIS-DAP info string). Using DAP_PACKET_SIZE keeps this
-  // sized to a known protocol bound.
   uint8_t scratch[DAP_PACKET_SIZE];
 
   switch (id) {
@@ -718,9 +698,7 @@ static uint32_t DAP_SWD_Transfer(uint32_t probeId, const uint8_t *request, uint8
   response_value = 0U;
   response_head  = response;
   response_limit = response_head + DAP_PACKET_SIZE;
-  // Fix #13: Clamp against the per-batch absolute end so chained sub-commands
-  // inside ID_DAP_ExecuteCommands cannot cumulatively overflow the global
-  // DAPResponseBuffer. DAPResponseLimit is set by DAP_ExecuteCommand.
+  // Clamp to per-batch ceiling so chained sub-commands can't overflow.
   if (DAPResponseLimit[probeId] != NULL && DAPResponseLimit[probeId] < response_limit) {
     response_limit = DAPResponseLimit[probeId];
   }
@@ -737,11 +715,7 @@ static uint32_t DAP_SWD_Transfer(uint32_t probeId, const uint8_t *request, uint8
 
   for (; request_count != 0U; request_count--) {
     request_value = *request++;
-    // Worst-case bytes one iteration can write into the response buffer:
-    //   post_read drain: 4 (data) [+ 4 (timestamp) if TS-tagged]
-    //   new transfer:    up to 4 (data) [+ 4 (timestamp) if TS-tagged]
-    // Bail out early if we cannot guarantee space, so the response is well-formed
-    // and the host learns from response_count how many transfers actually completed.
+    // Worst-case 16B/iter: post_read drain (4B + 4B timestamp) + new xfer (4B + 4B timestamp).
     if ((response + 16U) > response_limit) {
       break;
     }
@@ -949,7 +923,7 @@ static uint32_t DAP_SWD_Transfer(uint32_t probeId, const uint8_t *request, uint8
       if (response_value != DAP_TRANSFER_OK) {
         goto end;
       }
-      // Store previous data (only if it fits; otherwise drop the trailing word)
+      // Store previous data (drop the trailing word if it would overflow)
       if ((response + 4U) <= response_limit) {
         *response++ = (uint8_t) data;
         *response++ = (uint8_t)(data >>  8);
@@ -975,20 +949,12 @@ end:
 
 
 // Process JTAG Transfer command and prepare response
-//   probeId:  per-probe context (this file is multi-probe; JTAG_DP.c is NOT).
 //   request:  pointer to request data
 //   response: pointer to response data
 //   return:   number of bytes in response (lower 16 bits)
 //             number of bytes in request (upper 16 bits)
-//
-// NOTE: This dispatcher correctly accepts probeId, but the low-level
-// JTAG_DP.c helpers it calls (JTAG_Transfer, JTAG_IR, JTAG_ReadIDCode,
-// JTAG_WriteAbort, JTAG_Sequence) do NOT take probeId and were never
-// converted to be multi-probe-aware. Enabling DAP_JTAG=1 against more than
-// one probe would route every JTAG call to the same (effectively hardcoded)
-// hardware. A proper fix requires a PIO-backed per-probe JTAG implementation
-// analogous to sw_dp_pio.c for SWD. Until then, DAP_JTAG must stay 0 on
-// this firmware.
+// WARNING: this dispatcher takes probeId but the JTAG_DP.c helpers it calls
+// do not — DAP_JTAG=1 will route all probes to a single JTAG instance.
 #if (DAP_JTAG != 0)
 static uint32_t DAP_JTAG_Transfer(uint32_t probeId, const uint8_t *request, uint8_t *response) {
   const
@@ -1016,7 +982,6 @@ static uint32_t DAP_JTAG_Transfer(uint32_t probeId, const uint8_t *request, uint
   response_value = 0U;
   response_head  = response;
   response_limit = response_head + DAP_PACKET_SIZE;
-  // Fix #13: see DAP_SWD_Transfer for the rationale.
   if (DAPResponseLimit[probeId] != NULL && DAPResponseLimit[probeId] < response_limit) {
     response_limit = DAPResponseLimit[probeId];
   }
@@ -1037,8 +1002,7 @@ static uint32_t DAP_JTAG_Transfer(uint32_t probeId, const uint8_t *request, uint
 
   for (; request_count != 0U; request_count--) {
     request_value = *request++;
-    // Bail out if remaining response space cannot accommodate worst-case
-    // iteration writes (post_read drain + new transfer, both potentially TS-tagged).
+    // Worst-case 16B/iter: post_read drain + new xfer, both TS-tagged.
     if ((response + 16U) > response_limit) {
       break;
     }
@@ -1247,7 +1211,7 @@ static uint32_t DAP_JTAG_Transfer(uint32_t probeId, const uint8_t *request, uint
       if (response_value != DAP_TRANSFER_OK) {
         goto end;
       }
-      // Store previous data (only if it fits; otherwise drop the trailing word)
+      // Store previous data (drop trailing word if it would overflow)
       if ((response + 4U) <= response_limit) {
         *response++ = (uint8_t) data;
         *response++ = (uint8_t)(data >>  8);
@@ -1358,7 +1322,6 @@ static uint32_t DAP_SWD_TransferBlock(uint32_t probeId, const uint8_t *request, 
   response_value = 0U;
   response_head  = response;
   response_limit = response_head + DAP_PACKET_SIZE;
-  // Fix #13: see DAP_SWD_Transfer for the rationale.
   if (DAPResponseLimit[probeId] != NULL && DAPResponseLimit[probeId] < response_limit) {
     response_limit = DAPResponseLimit[probeId];
   }
@@ -1389,8 +1352,6 @@ static uint32_t DAP_SWD_TransferBlock(uint32_t probeId, const uint8_t *request, 
       }
     }
     while (request_count--) {
-      // Stop early if storing another word would overflow the response buffer.
-      // Per CMSIS-DAP, the host learns from response_count how many transfers actually completed.
       if ((response + 4U) > response_limit) {
         break;
       }
@@ -1469,7 +1430,6 @@ static uint32_t DAP_JTAG_TransferBlock(uint32_t probeId, const uint8_t *request,
   response_value = 0U;
   response_head  = response;
   response_limit = response_head + DAP_PACKET_SIZE;
-  // Fix #13: see DAP_SWD_Transfer for the rationale.
   if (DAPResponseLimit[probeId] != NULL && DAPResponseLimit[probeId] < response_limit) {
     response_limit = DAPResponseLimit[probeId];
   }
@@ -1507,8 +1467,6 @@ static uint32_t DAP_JTAG_TransferBlock(uint32_t probeId, const uint8_t *request,
     }
     // Read register block
     while (request_count--) {
-      // Stop early if storing another word would overflow the response buffer.
-      // Per CMSIS-DAP, the host learns from response_count how many transfers actually completed.
       if ((response + 4U) > response_limit) {
         break;
       }
@@ -1726,14 +1684,7 @@ uint32_t DAP_ProcessCommand(uint32_t probeId, const uint8_t *request, uint8_t *r
   switch (*request++) {
     case ID_DAP_Info:
     {
-      /* Fix #16d: clamp the data write to the remaining per-batch response
-       * headroom so DAP_Info cannot overrun the 64-byte DAPResponseBuffer
-       * slot when invoked late in a chained ID_DAP_ExecuteCommands. Data
-       * is written at (response+1) (response[0] is the length byte); the
-       * available headroom for the data payload is the per-batch ceiling
-       * established in DAP_ExecuteCommand minus the data write address.
-       * If DAPResponseLimit is unset (a bare DAP_ProcessCommand call) we
-       * fall back to the full DAP_PACKET_SIZE budget. */
+      // Clamp DAP_Info write to remaining per-batch headroom; strings can be ~60B.
       uint8_t *data_ptr = response + 1;
       uint32_t headroom;
       if (DAPResponseLimit[probeId] != NULL && DAPResponseLimit[probeId] > data_ptr) {
@@ -1809,16 +1760,8 @@ uint32_t DAP_ProcessCommand(uint32_t probeId, const uint8_t *request, uint8_t *r
       num = DAP_WriteAbort(probeId, request, response);
       break;
 
-    // Fix #14: ID_DAP_TransferAbort was previously unhandled and fell through
-    // to default -> ID_DAP_Invalid. The CMSIS-DAP spec requires this command
-    // to be acknowledged. True preemption requires out-of-band handling (the
-    // host normally sends Abort on a different USB transfer while a transfer
-    // is in flight). This firmware processes all commands through a single
-    // per-probe dap_thread queue, so by the time we run this case any prior
-    // transfer has already completed -- setting the flag is best-effort and
-    // will only have an effect on a transfer that happens to start between
-    // now and the next time the flag is cleared at the top of a transfer
-    // loop. Returning DAP_OK is at least protocol-compliant.
+    // Best-effort: single per-probe queue means any in-flight xfer has already
+    // finished by the time we run; flag only affects the next one started.
     case ID_DAP_TransferAbort:
       DAP_TransferAbort[probeId] = 1U;
       *response = DAP_OK;
@@ -1865,9 +1808,6 @@ uint32_t DAP_ProcessCommand(uint32_t probeId, const uint8_t *request, uint8_t *r
 //             number of bytes in request (upper 16 bits)
 uint32_t DAP_ExecuteCommand(uint32_t probeId, const uint8_t *request, uint8_t *response) {
   uint32_t cnt, num, n;
-  // Fix #13: Establish the absolute per-batch response-buffer ceiling so the
-  // transfer helpers can clamp their per-iteration response_limit. The caller
-  // (tusb_edpt_handler.c) always hands us a DAP_PACKET_SIZE-byte buffer.
   uint8_t *const response_end = response + DAP_PACKET_SIZE;
   DAPResponseLimit[probeId] = response_end;
 
@@ -1877,12 +1817,7 @@ uint32_t DAP_ExecuteCommand(uint32_t probeId, const uint8_t *request, uint8_t *r
     *response++ = (uint8_t)cnt;
     num = (2U << 16) | 2U;
     while (cnt--) {
-      // Fix #13: Stop chaining if we cannot guarantee at least one more
-      // sub-command's minimum response (1 echo byte + 1 status byte = 2).
-      // Each sub-command's per-iteration bounds check (response + 16 > limit
-      // for Transfer, response + 4 > limit for TransferBlock) handles its
-      // own per-iteration bound; this outer check prevents a sub-command
-      // from being dispatched with no headroom at all.
+      // Stop if no room for even the 2-byte minimum sub-command response.
       if ((response + 2U) > response_end) {
         break;
       }

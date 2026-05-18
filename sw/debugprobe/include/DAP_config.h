@@ -55,15 +55,7 @@ This information includes:
 
 /// Processor Clock of the Cortex-M MCU used in the Debug Unit.
 /// This value is used to calculate the SWD/JTAG clock speed.
-/* Fix #12: CPU_CLOCK MUST match the actual system clock set in main.c
- * (set_sys_clock_khz(252000, ...)). DAP_SWJ_Clock converts the host's
- * requested kHz into an abstract delay counter using CPU_CLOCK, and
- * MAKE_KHZ (sw_dp_pio.c) inverts that counter back into kHz to drive
- * the PIO clock divider (probe_set_swclk_freq), which is computed
- * against the true sysclk. If CPU_CLOCK does not match the true sysclk,
- * the SWCLK frequency the target sees will not match what the host
- * requested. If you change set_sys_clock_khz in main.c you MUST update
- * this value in lockstep. */
+/* Must match set_sys_clock_khz() in main.c; mismatch scales every SWCLK request. */
 #define CPU_CLOCK               252000000U      ///< Specifies the CPU Clock in Hz.
 
 /// Number of processor cycles for I/O Port write operations.
@@ -326,8 +318,7 @@ Configures the DAP Hardware I/O pins for Serial Wire Debug (SWD) mode:
  - SWCLK, SWDIO, nRESET to output mode and set to default high level.
  - TDI, nTRST to HighZ mode (pins are unused in SWD mode).
 */
-// hack - zap our "stop doing divides everywhere" cache.
-// Fix #10: cache is per-probe now; reset only this probe's slot.
+// hack - zap our "stop doing divides everywhere" cache
 __STATIC_INLINE void PORT_SWD_SETUP (uint32_t probeId) {
   probe_init(probeId);
   probes[probeId].cached_delay = 0;

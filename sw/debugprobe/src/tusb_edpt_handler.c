@@ -6,12 +6,7 @@
 
 #include "tusb_edpt_handler.h"
 #include "DAP.h"
-/* Fix #16f: probe_deinit() puts the SWD pads HiZ. Needed on cooperative
- * exit (e.g. USB cable yank -> tud_unmount_cb -> should_exit) so we match
- * Fix #2's invariant ("pads are HiZ whenever this probe is not active");
- * without this, DAP_Disconnect is the only path that drops pads, and a
- * cable yank skips that. */
-#include "probe.h"
+#include "probe.h"  // probe_deinit() for cooperative-exit HiZ on cable yank
 
 #define WR_IDX(x) (x.wptr % DAP_PACKET_COUNT)
 #define RD_IDX(x) (x.rptr % DAP_PACKET_COUNT)
@@ -37,12 +32,6 @@ void dap_edpt_init(void) {
 		struct DAPEndpointState* state = &ep_states[i];
 		state->itf_num = 0;
 		state->probeId = i;
-		/* Fix #15: create the ring mutex exactly once. dap_edpt_init is the
-		 * tinyUSB class-driver init hook, invoked from tusb_init() in main()
-		 * BEFORE vTaskStartScheduler(). xSemaphoreCreateMutex is safe to call
-		 * pre-scheduler (it only allocates from the heap and initialises the
-		 * queue struct). Guard against a second init pass (re-enumeration)
-		 * leaking a mutex by only creating when NULL. */
 		if (state->ring_mutex == NULL)
 			state->ring_mutex = xSemaphoreCreateMutex();
 	}
@@ -116,7 +105,6 @@ uint16_t dap_edpt_open(uint8_t rhport, tusb_desc_interface_t const *itf_desc, ui
 
 	struct DAPEndpointState* state = &ep_states[itf_desc->bInterfaceNumber];
 
-	// Record the root hub port so later usbd_edpt_xfer calls target the right controller
 	state->_rhport = rhport;
 
 	//  Initialise circular buffer indices
@@ -180,10 +168,6 @@ bool dap_edpt_xfer_cb(uint8_t __unused rhport, uint8_t ep_addr, xfer_result_t re
 	{
 		if(xferred_bytes >= 0u && xferred_bytes <= DAP_PACKET_SIZE)
 		{
-			/* Fix #15: serialise ring-index updates and the usbd_edpt_xfer
-			 * re-arm against the producer in dap_thread. Skip the lock if
-			 * ring_mutex hasn't been created yet (shouldn't happen --
-			 * dap_edpt_init runs before the scheduler) to stay NULL-safe. */
 			if (state->ring_mutex != NULL)
 				xSemaphoreTake(state->ring_mutex, portMAX_DELAY);
 
@@ -203,12 +187,7 @@ bool dap_edpt_xfer_cb(uint8_t __unused rhport, uint8_t ep_addr, xfer_result_t re
 			if (state->ring_mutex != NULL)
 				xSemaphoreGive(state->ring_mutex);
 
-			/* Fix #11c: dap_taskhandle can be NULL between tud_unmount_cb
-			 * (sets should_exit) and the next tud_mount_cb. xTaskNotifyGive(NULL)
-			 * trips configASSERT, so just drop the notify if the task is gone.
-			 * Fix #15: notify outside the mutex -- task notifications don't
-			 * need ring_mutex and keeping them outside shortens the critical
-			 * section. */
+			// Handle can be NULL between unmount and next mount; xTaskNotifyGive(NULL) asserts.
 			if (state->dap_taskhandle != NULL)
 				xTaskNotifyGive(state->dap_taskhandle);
 			return true;
@@ -220,9 +199,6 @@ bool dap_edpt_xfer_cb(uint8_t __unused rhport, uint8_t ep_addr, xfer_result_t re
 
 		if(xferred_bytes >= 0u && xferred_bytes <= DAP_PACKET_SIZE)
 		{
-			/* Fix #15: serialise against dap_thread, which also reads
-			 * wasFull and bumps wptr / re-arms the OUT xfer when it drains
-			 * a full buffer. */
 			if (state->ring_mutex != NULL)
 				xSemaphoreTake(state->ring_mutex, portMAX_DELAY);
 
@@ -241,8 +217,6 @@ bool dap_edpt_xfer_cb(uint8_t __unused rhport, uint8_t ep_addr, xfer_result_t re
 			if (state->ring_mutex != NULL)
 				xSemaphoreGive(state->ring_mutex);
 
-			/* Fix #11c: see note above; guard against NULL handle.
-			 * Fix #15: notify outside the mutex. */
 			if (state->dap_taskhandle != NULL)
 				xTaskNotifyGive(state->dap_taskhandle);
 			return true;
@@ -259,20 +233,9 @@ void dap_thread(void *ptr)
 	uint32_t n;
 	do
 	{
-		/* Fix #11a: cooperative exit. tud_unmount_cb sets should_exit and
-		 * notifies us; at the top of the outer loop we own no mutexes and
-		 * the scheduler is not suspended, so it is safe to self-delete.
-		 * Self-delete (vs vTaskDelete from another task) ensures any
-		 * mutexes/scheduler-suspends taken inside the inner block have
-		 * already been released by us. */
-		if (state->should_exit)
+		if (state->should_exit)  // cooperative exit; top of loop owns no mutexes
 		{
-			/* Fix #16f: drop the SWD pads to HiZ before self-deleting. On
-			 * a USB cable yank the host never sends DAP_Disconnect, so this
-			 * cooperative-exit path is the only place that can put the pads
-			 * back to a safe state for this probe. probe_deinit() unloads
-			 * the PIO program and disables the state machine. */
-			probe_deinit(state->probeId);
+			probe_deinit(state->probeId);  // HiZ pads; cable yank skips DAP_Disconnect
 			state->dap_taskhandle = NULL;
 			vTaskDelete(NULL);
 			/* unreachable */
@@ -306,12 +269,6 @@ void dap_thread(void *ptr)
 			// If the buffer was full in the out callback, we need to queue up another buffer for the endpoint to consume, now that we know there is space in the buffer.
 			if(state->USBRequestBuffer.wasFull)
 			{
-				/* Fix #15: use the per-state ring_mutex instead of
-				 * vTaskSuspendAll/xTaskResumeAll. usbd_edpt_xfer internally
-				 * takes osal mutexes, and FreeRTOS forbids mutex acquisition
-				 * while the scheduler is suspended. The mutex provides the
-				 * same mutual exclusion against the OUT xfer_cb without that
-				 * illegality. */
 				if (state->ring_mutex != NULL)
 					xSemaphoreTake(state->ring_mutex, portMAX_DELAY);
 				state->USBRequestBuffer.wptr++;
@@ -327,17 +284,10 @@ void dap_thread(void *ptr)
 					dap_cmd_string[DAPResponseBuffer[0]]);*/
 
 
-			/* Fix #15: per-state ring_mutex replaces vTaskSuspendAll. See
-			 * the matching comment on the wasFull branch above and the
-			 * mutex creation in dap_edpt_init for the full rationale --
-			 * usbd_edpt_xfer takes osal mutexes internally and cannot be
-			 * called with the scheduler suspended. The mutex serialises
-			 * this producer block against the IN xfer_cb consumer block. */
 			if (state->ring_mutex != NULL)
 				xSemaphoreTake(state->ring_mutex, portMAX_DELAY);
 
-			// Compute the slot index BEFORE bumping wptr so the IN-callback consumer
-			// can read the matching length from resp_lens[] for the slot it is sending.
+			// Capture slot index before bumping wptr so IN cb sees matching resp_lens[].
 			uint32_t wr_slot = WR_IDX(state->USBResponseBuffer);
 			memcpy(&state->USBResponseBuffer.data[wr_slot][0], state->DAPResponseBuffer, (uint16_t) resp_len);
 			state->resp_lens[wr_slot] = (uint16_t) resp_len;
@@ -403,9 +353,7 @@ DAPEndpointState* getEndpointStateByEndpointAddr(uint8_t ep_addr)
 	for(int i=0;i<MAX_DAP_PROBES;i++)
 	{
 		struct DAPEndpointState* state = &ep_states[i];
-		/* Fix #11c: tud_unmount_cb zeros _out_ep_addr/_in_ep_addr so a
-		 * stale xfer_cb after teardown cannot accidentally match against
-		 * a torn-down state. Both being zero means "not open". */
+		// Both ep addrs zero == torn-down state; skip so stale cb can't match.
 		if(state->_out_ep_addr == 0 && state->_in_ep_addr == 0)
 			continue;
 		if(state->_out_ep_addr == ep_addr)

@@ -48,21 +48,11 @@ typedef struct DAPEndpointState
 
 	TaskHandle_t dap_taskhandle;
 
-	/* Fix #11a: cooperative-exit flag. tud_unmount_cb sets this and notifies
-	 * the task; dap_thread observes it at the top of its outer loop and
-	 * self-deletes after clearing dap_taskhandle. Self-delete avoids leaking
-	 * pio_mutex or the scheduler-suspend counter that vTaskDelete from
-	 * another task would otherwise leave behind. */
+	/* Cooperative exit: set by tud_unmount_cb, observed at top of dap_thread loop. */
 	volatile bool should_exit;
 
-	/* Fix #15: per-state mutex serializing producer (dap_thread) and
-	 * consumers (IN/OUT xfer_cb directions) against the ring-buffer
-	 * indices and the usbd_edpt_xfer kick. Replaces the previous
-	 * vTaskSuspendAll/xTaskResumeAll brackets in dap_thread, which were
-	 * illegal: tinyUSB's usbd_edpt_xfer internally takes osal mutexes,
-	 * and FreeRTOS forbids any mutex acquisition while the scheduler is
-	 * suspended. Created once in dap_edpt_init (before the scheduler
-	 * starts) and never destroyed. */
+	/* Serializes ring updates between dap_thread and xfer_cb; usbd_edpt_xfer
+	 * cannot be called with the scheduler suspended (it takes osal mutexes). */
 	SemaphoreHandle_t ring_mutex;
 } DAPEndpointState;
 

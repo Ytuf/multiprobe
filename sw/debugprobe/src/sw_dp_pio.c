@@ -33,11 +33,6 @@
  * Ideally we don't want calls to udiv everywhere... */
 #define MAKE_KHZ(x) (CPU_CLOCK / (2000 * ((x) + 1)))
 
-/* Fix #10: cached_delay was previously a single global volatile uint32_t.
- * With multiple probes running concurrently at potentially different SWCLK
- * rates the cache was wrong for any probe but the most-recently-configured
- * one. Per-probe state now lives in probes[probeId].cached_delay. */
-
 // Generate SWJ Sequence
 //   count:  sequence bit count
 //   data:   pointer to sequence bit data

@@ -36,9 +36,7 @@
 
 #define MAX_DAP_PROBES 4		// TODO: make configurable when stable
 
-// Forward declaration of the per-probe state record. The full layout lives
-// in probe.c; only fields meant to be touched from other compilation units
-// (e.g. sw_dp_pio.c needs `cached_delay`) are exposed here.
+// In the header so sw_dp_pio.c can reach cached_delay directly.
 struct _probe {
     const char* name;
 
@@ -54,8 +52,6 @@ struct _probe {
 
     int activityLedPin;
 
-    // Fix #10: per-probe cached SWCLK delay (kept here so sw_dp_pio.c can
-    // skip redundant probe_set_swclk_freq calls without a global cache).
     uint32_t cached_delay;
 };
 

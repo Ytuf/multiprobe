@@ -37,10 +37,7 @@
 #include "probe.h"
 #include "tusb.h"
 
-// Fix #7: per-PIO mutex protecting pio_add_program / pio_remove_program.
-// Pico SDK's program-allocation calls are not thread-safe and two probes
-// sharing a PIO (e.g. DISPLAY+MAIN on pio0) can race when their dap_threads
-// both Connect concurrently.
+// Protects pio_add_program / pio_remove_program; SDK calls are not thread-safe.
 static SemaphoreHandle_t pio_mutex[NUM_PIOS];
 
 #define DIV_ROUND_UP(m, n)	(((m) + (n) - 1) / (n))
@@ -60,14 +57,10 @@ CU_REGISTER_DEBUG_PINS(probe_timing)
 
 #define PROBE_BUF_SIZE 8192
 
-// Timestamp of last SWD activity (any probe, any direction). Drives the
-// yellow "SWD active" LED. uint32 wraps every ~71 min; unsigned subtract
-// in the LED update is wrap-safe.
+// Last SWD edge across all probes; drives the activity LED. uint32 wrap is
+// safe under unsigned subtract in probe_led_update.
 static volatile uint32_t swd_last_activity_us = 0;
-#define SWD_ACT_LED_HOLD_US 100000  // hold LED on for 100ms after last edge
-
-// struct _probe is declared in probe.h so sw_dp_pio.c can touch
-// per-probe state (e.g. cached_delay) directly.
+#define SWD_ACT_LED_HOLD_US 100000
 
 struct _probe probes[MAX_DAP_PROBES] = {
     PROBE_CONFIG0,       // Default
@@ -189,16 +182,9 @@ void probe_init(uint32_t probeId) {
         return;
 
     if (!probes[probeId].initted) {
-        // Fix #7: serialize PIO program memory mutation against the other
-        // probe sharing this PIO instance.
         SemaphoreHandle_t mutex = pio_mutex[pio_get_index(probes[probeId].pio)];
         if (mutex) xSemaphoreTake(mutex, portMAX_DELAY);
-        // Fix #14: pio_add_program returns -1 (as uint) when PIO instruction
-        // memory is exhausted. Pre-check under the mutex so check-then-add is
-        // atomic against a concurrent pio_remove_program on the same PIO. If
-        // allocation would fail, release the mutex and leave initted=0 so the
-        // caller sees this probe as un-inited rather than driving PIO at a
-        // garbage 0xFFFFFFFF instruction address.
+        // Check-then-add must be atomic; pio_add_program returns (uint)-1 on OOM.
         if (!pio_can_add_program(probes[probeId].pio, &probe_program)) {
             if (mutex) xSemaphoreGive(mutex);
             probe_info("probe_init: PIO%d instruction memory exhausted, probe %d not initted\n",
@@ -230,7 +216,6 @@ void probe_deinit(uint32_t probeId)
     probe_read_mode(probeId);
     pio_sm_set_enabled(probes[probeId].pio, probes[probeId].sm, 0);
 
-    // Fix #7: serialize PIO program memory mutation.
     SemaphoreHandle_t mutex = pio_mutex[pio_get_index(probes[probeId].pio)];
     if (mutex) xSemaphoreTake(mutex, portMAX_DELAY);
     pio_remove_program(probes[probeId].pio, &probe_program, probes[probeId].offset);
@@ -238,11 +223,8 @@ void probe_deinit(uint32_t probeId)
 
     probe_assert_reset(probeId, 1);	// de-assert nRESET
 
-    // Fix #2: CMSIS-DAP spec says SWCLK/SWDIO must be HiZ when disconnected.
-    // After disabling the SM and removing the program, the pads are still
-    // assigned to the PIO function with whatever direction the last
-    // transaction left them in. Use the helper from probe.pio to return
-    // them to plain-GPIO input with pulls disabled.
+    // CMSIS-DAP requires SWCLK/SWDIO HiZ when disconnected; SM disable alone
+    // leaves the pads in whatever direction the last transaction set.
     probe_gpio_deinit(probes[probeId].pio, probes[probeId].clkPin, probes[probeId].dioPin);
 
     probes[probeId].initted = 0;
@@ -251,9 +233,6 @@ void probe_deinit(uint32_t probeId)
 
 void probe_led_init()
 {
-    // Fix #7: create per-PIO mutexes once at boot. probe_led_init is called
-    // a single time from main() before any probe is connected, so it's a
-    // convenient one-shot init site.
     for (int i = 0; i < NUM_PIOS; i++)
     {
         if (pio_mutex[i] == NULL)

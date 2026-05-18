@@ -70,16 +70,6 @@ extern SemaphoreHandle_t globalMutex;
 
 static int was_configured;
 
-/*
- * Fix #6: SOF watchdog (dev_mon) removed. The previous implementation tore
- * down and re-initialized the tinyUSB stack after only ~15ms (3 samples *
- * 100 ticks at configTICK_RATE_HZ=20000) of identical SOF reads, which fired
- * on normal hub jitter and ran with no coordination against the per-probe
- * dap_thread tasks -- leaving them holding stale endpoint/buffer state into
- * a freshly-reinitialized stack. tinyUSB already handles bus events; this
- * hand-rolled watchdog caused more wedges than it prevented.
- */
-
 
 void usb_thread(void *ptr)
 {
@@ -133,25 +123,21 @@ int main(void)
     set_sys_clock_khz(252000, true);
     sleep_ms(100);
 
-    // Board status LED (GPIO2) - solid on
     gpio_init(BOARD_LED_PIN);
     gpio_set_dir(BOARD_LED_PIN, GPIO_OUT);
     gpio_put(BOARD_LED_PIN, 1);
 
-    // PIC MCLR pull (GPIO3): input with internal pull-up. Pin is not actively
-    // driven -- it idles high via the pull and can be yanked low externally.
+    // PIC MCLR: idles high via internal pull-up, can be yanked low externally.
     gpio_init(PIC_MCLR_PULL_PIN);
     gpio_set_dir(PIC_MCLR_PULL_PIN, GPIO_IN);
     gpio_pull_up(PIC_MCLR_PULL_PIN);
 
-    // I2C0 -> PROM (GPIO0/1)
     i2c_init(PROM_I2C_INSTANCE, 100 * 1000);
     gpio_set_function(PROM_I2C_SDA_PIN, GPIO_FUNC_I2C);
     gpio_set_function(PROM_I2C_SCL_PIN, GPIO_FUNC_I2C);
     gpio_pull_up(PROM_I2C_SDA_PIN);
     gpio_pull_up(PROM_I2C_SCL_PIN);
 
-    // I2C1 -> PROM1 (GPIO18/19)
     i2c_init(PROM1_I2C_INSTANCE, 100 * 1000);
     gpio_set_function(PROM1_I2C_SDA_PIN, GPIO_FUNC_I2C);
     gpio_set_function(PROM1_I2C_SCL_PIN, GPIO_FUNC_I2C);
@@ -180,7 +166,6 @@ int main(void)
 
     if (THREADED) {
         xTaskCreate(usb_thread, "TUD", configMINIMAL_STACK_SIZE, NULL, TUD_TASK_PRIO, &tud_taskhandle);
-        /* Fix #6: SOF watchdog task (dev_mon) removed -- see comment above. */
         xTaskCreate(cdc_uart_core2, "UART", configMINIMAL_STACK_SIZE, NULL, HWUART_TASK_PRIO, &uart_taskHandle);
 
         vTaskStartScheduler();
@@ -233,13 +218,11 @@ void tud_suspend_cb(bool remote_wakeup_en)
   probe_info("Suspended\n");
   /* Were we actually configured? If not, threads don't exist */
   if (was_configured) {
-    /* Fix #11b: guard suspend with non-NULL handle. */
     for(int i=0;i<MAX_UART_DEVICES;i++)
     {
       if(uartDevices[i].isConfigured && uartDevices[i].uart_taskHandle != NULL)
   	    vTaskSuspend(uartDevices[i].uart_taskHandle);
     }
-    /* Fix #1: suspend each per-probe dap_thread (handles live in ep_states), not a NULL global. */
     for(int i=0;i<MAX_DAP_PROBES;i++)
     {
       DAPEndpointState* state = getEndpointStateByIndex(i);
@@ -254,13 +237,11 @@ void tud_resume_cb(void)
 {
   probe_info("Resumed\n");
   if (was_configured) {
-    /* Fix #11b: guard resume with non-NULL handle. */
     for(int i=0;i<MAX_UART_DEVICES;i++)
     {
       if(uartDevices[i].isConfigured && uartDevices[i].uart_taskHandle != NULL)
   	    vTaskResume(uartDevices[i].uart_taskHandle);
     }
-    /* Fix #1: resume each per-probe dap_thread, not a NULL global. */
     for(int i=0;i<MAX_DAP_PROBES;i++)
     {
       DAPEndpointState* state = getEndpointStateByIndex(i);
@@ -273,18 +254,11 @@ void tud_resume_cb(void)
 void tud_unmount_cb(void)
 {
   probe_info("Disconnected\n");
-  /* Fix #11b: guard UART suspend with non-NULL handle so a repeat unmount
-   * (without an intervening mount) doesn't suspend a stale handle. */
   for(int i=0;i<MAX_UART_DEVICES;i++)
   {
     if(uartDevices[i].isConfigured && uartDevices[i].uart_taskHandle != NULL)
       vTaskSuspend(uartDevices[i].uart_taskHandle);
   }
-  /* Fix #11a: do NOT vTaskSuspend dap_thread here. Suspending mid-critical-
-   * section would freeze the task while it still owns pio_mutex or the
-   * scheduler-suspend counter. Instead we set should_exit and let the task
-   * self-delete at the top of its outer loop where it owns nothing. */
-  /* Fix #11b: null-and-clear UART handles to match the dap-side pattern. */
   for(int i=0;i<MAX_UART_DEVICES;i++)
   {
     if(uartDevices[i].isConfigured && uartDevices[i].uart_taskHandle != NULL)
@@ -293,27 +267,19 @@ void tud_unmount_cb(void)
       uartDevices[i].uart_taskHandle = NULL;
     }
   }
-  /* Fix #11a: cooperative-exit pattern. Signal each dap_thread to self-
-   * delete and wake it so it observes the flag promptly. The task itself
-   * clears state->dap_taskhandle to NULL before vTaskDelete(NULL).
-   * Fix #11c: zero the endpoint addresses so a stale xfer_cb after teardown
-   * cannot resolve to this state (see getEndpointStateByEndpointAddr). */
+  /* Cooperative exit: dap_thread observes should_exit at top of its loop and
+   * self-deletes. Synchronous vTaskDelete here would leak pio_mutex / the
+   * scheduler-suspend counter if the task were inside a critical section. */
   for(int i=0;i<MAX_DAP_PROBES;i++)
   {
     DAPEndpointState* state = getEndpointStateByIndex(i);
     if(state->dap_taskhandle != NULL)
     {
       state->should_exit = true;
-      /* Fix #16b: if tud_suspend_cb already ran, the dap_thread is in
-       * FreeRTOS SUSPENDED state. Task notifications do NOT wake a
-       * suspended task -- only vTaskResume does. Without this resume the
-       * task stays suspended forever, never observes should_exit, never
-       * self-deletes, and the handle never goes NULL, wedging future mount
-       * cycles. Resume is a no-op (with internal critical-section safety)
-       * for a task that is not currently suspended. */
-      vTaskResume(state->dap_taskhandle);
+      vTaskResume(state->dap_taskhandle);  // notify doesn't wake SUSPENDED tasks
       xTaskNotifyGive(state->dap_taskhandle);
     }
+    /* Zero ep addrs so a stale xfer_cb can't resolve to a torn-down state. */
     state->_in_ep_addr = 0;
     state->_out_ep_addr = 0;
   }
@@ -326,8 +292,6 @@ void tud_mount_cb(void)
   if (!was_configured) {
     /* UART needs to preempt USB as if we don't, characters get lost */
 
-    /* Fix #11b: only (re)create the UART task if no live handle exists
-     * (tud_unmount_cb clears these to NULL after vTaskDelete). */
     for(int i=0;i<MAX_UART_DEVICES;i++)
     {
       if(uartDevices[i].isConfigured && uartDevices[i].uart_taskHandle == NULL)
@@ -344,21 +308,8 @@ void tud_mount_cb(void)
     }
 
     /* Lowest priority thread is debug - need to shuffle buffers before we can toggle swd... */
-    /* Fix #1: only create a per-probe dap_thread if one isn't already alive (tud_unmount_cb clears the handle). */
-    /* Fix #11a: clear should_exit before (re)creating, so the new task
-     * doesn't immediately self-delete on a stale flag from a prior
-     * teardown.
-     * Fix #16a: clear should_exit UNCONDITIONALLY (outside the handle==NULL
-     * guard). On a fast re-enumeration the prior dap_thread may not yet have
-     * been scheduled to observe its old should_exit=true and self-delete --
-     * its dap_taskhandle is still non-NULL here. If we left should_exit=true
-     * the old task would self-delete the moment it next runs and we would
-     * have skipped recreating it; was_configured=1 + handle going to NULL
-     * later wedges the probe forever. Resetting unconditionally makes the
-     * flag sticky=false for every probe; an old task that hasn't yet seen
-     * the old true value will simply observe false and keep running normally.
-     * tud_unmount_cb has already been run (was_configured was cleared) so
-     * there is no live "intent to exit" we are clobbering here. */
+    /* Clear should_exit unconditionally: a fast re-enumeration may run before
+     * the prior task self-deletes; we must not let a stale flag kill it. */
     for(int i=0;i<MAX_DAP_PROBES;i++)
     {
       DAPEndpointState* state = getEndpointStateByIndex(i);
@@ -379,9 +330,6 @@ void vApplicationTickHook (void)
 
 void vApplicationStackOverflowHook(TaskHandle_t Task, char *pcTaskName)
 {
-  /* Fix #11d: %s expects a const char*; *pcTaskName would pass a single
-   * char value, which the format would dereference as a pointer and crash
-   * the diagnostic itself. pcTaskName is already a char* — use it as-is. */
   panic("stack overflow (not the helpful kind) for %s\n", pcTaskName);
 }
 
