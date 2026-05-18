@@ -75,7 +75,7 @@ static const char TargetDeviceName   [] = TARGET_DEVICE_NAME;
 //   return:  number of bytes written to info (always <= max_len)
 static uint8_t DAP_Info(uint8_t id, uint8_t *info, uint8_t max_len) {
   uint8_t length = 0U;
-  uint8_t scratch[DAP_PACKET_SIZE];
+  uint8_t scratch[128];  // longest DAP_Info string is ~60 bytes
 
   switch (id) {
     case DAP_ID_VENDOR:
