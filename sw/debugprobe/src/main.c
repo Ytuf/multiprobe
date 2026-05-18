@@ -259,17 +259,7 @@ void tud_unmount_cb(void)
     if(uartDevices[i].isConfigured && uartDevices[i].uart_taskHandle != NULL)
       vTaskSuspend(uartDevices[i].uart_taskHandle);
   }
-  for(int i=0;i<MAX_UART_DEVICES;i++)
-  {
-    if(uartDevices[i].isConfigured && uartDevices[i].uart_taskHandle != NULL)
-    {
-      vTaskDelete(uartDevices[i].uart_taskHandle);
-      uartDevices[i].uart_taskHandle = NULL;
-    }
-  }
-  /* Cooperative exit: dap_thread observes should_exit at top of its loop and
-   * self-deletes. Synchronous vTaskDelete here would leak pio_mutex / the
-   * scheduler-suspend counter if the task were inside a critical section. */
+  /* Signal cooperative exit to all dap_threads. */
   for(int i=0;i<MAX_DAP_PROBES;i++)
   {
     DAPEndpointState* state = getEndpointStateByIndex(i);
@@ -279,9 +269,30 @@ void tud_unmount_cb(void)
       vTaskResume(state->dap_taskhandle);  // notify doesn't wake SUSPENDED tasks
       xTaskNotifyGive(state->dap_taskhandle);
     }
+  }
+  /* Wait for self-deletion before zeroing ep addrs, so the old task can't
+   * write to NULL endpoints and the next tud_mount_cb sees a quiescent state. */
+  for(int i=0;i<MAX_DAP_PROBES;i++)
+  {
+    DAPEndpointState* state = getEndpointStateByIndex(i);
+    TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(100);
+    while (state->dap_taskhandle != NULL && xTaskGetTickCount() < deadline)
+      vTaskDelay(pdMS_TO_TICKS(1));
+  }
+  for(int i=0;i<MAX_DAP_PROBES;i++)
+  {
+    DAPEndpointState* state = getEndpointStateByIndex(i);
     /* Zero ep addrs so a stale xfer_cb can't resolve to a torn-down state. */
     state->_in_ep_addr = 0;
     state->_out_ep_addr = 0;
+  }
+  for(int i=0;i<MAX_UART_DEVICES;i++)
+  {
+    if(uartDevices[i].isConfigured && uartDevices[i].uart_taskHandle != NULL)
+    {
+      vTaskDelete(uartDevices[i].uart_taskHandle);
+      uartDevices[i].uart_taskHandle = NULL;
+    }
   }
   was_configured = 0;
 }

@@ -79,6 +79,8 @@ void DAP_SETUP (uint32_t probeId)
 
 void probe_set_swclk_freq(uint32_t probeId, uint freq_khz) {
     assert(probeId < MAX_DAP_PROBES);
+    if (freq_khz == 0) freq_khz = 1;
+    if (freq_khz > 30000) freq_khz = 30000;
     uint clk_sys_freq_khz = clock_get_hz(clk_sys) / 1000;
     probe_info("Set swclk freq %dKHz sysclk %dkHz\n", freq_khz, clk_sys_freq_khz);
     uint32_t divider = clk_sys_freq_khz / freq_khz / 4;
@@ -125,6 +127,8 @@ static inline uint32_t fmt_probe_command(uint32_t probeId, uint bit_count, bool 
 
 void probe_write_bits(uint32_t probeId, uint bit_count, uint32_t data_byte) {
     assert(probeId < MAX_DAP_PROBES);
+    // SM disabled (PIO exhaustion etc) -> put_blocking would hang on a non-draining FIFO.
+    if (!probes[probeId].initted) return;
     DEBUG_PINS_SET(probe_timing, DBG_PIN_WRITE);
     pio_sm_put_blocking(probes[probeId].pio, probes[probeId].sm, fmt_probe_command(probeId, bit_count, true, CMD_WRITE));
     pio_sm_put_blocking(probes[probeId].pio, probes[probeId].sm, data_byte);
@@ -136,12 +140,14 @@ void probe_write_bits(uint32_t probeId, uint bit_count, uint32_t data_byte) {
 
 void probe_hiz_clocks(uint32_t probeId, uint bit_count) {
     assert(probeId < MAX_DAP_PROBES);
+    if (!probes[probeId].initted) return;
     pio_sm_put_blocking(probes[probeId].pio, probes[probeId].sm, fmt_probe_command(probeId, bit_count, false, CMD_TURNAROUND));
     pio_sm_put_blocking(probes[probeId].pio, probes[probeId].sm, 0);
 }
 
 uint32_t probe_read_bits(uint32_t probeId, uint bit_count) {
     assert(probeId < MAX_DAP_PROBES);
+    if (!probes[probeId].initted) return 0;
     DEBUG_PINS_SET(probe_timing, DBG_PIN_READ);
     pio_sm_put_blocking(probes[probeId].pio, probes[probeId].sm, fmt_probe_command(probeId, bit_count, false, CMD_READ));
     uint32_t data = pio_sm_get_blocking(probes[probeId].pio, probes[probeId].sm);
@@ -165,12 +171,14 @@ static void probe_wait_idle(uint32_t probeId) {
 
 void probe_read_mode(uint32_t probeId) {
     assert(probeId < MAX_DAP_PROBES);
+    if (!probes[probeId].initted) return;
     pio_sm_put_blocking(probes[probeId].pio, probes[probeId].sm, fmt_probe_command(probeId, 0, false, CMD_SKIP));
     probe_wait_idle(probeId);
 }
 
 void probe_write_mode(uint32_t probeId) {
     assert(probeId < MAX_DAP_PROBES);
+    if (!probes[probeId].initted) return;
     pio_sm_put_blocking(probes[probeId].pio, probes[probeId].sm, fmt_probe_command(probeId, 0, true, CMD_SKIP));
     probe_wait_idle(probeId);
 }
@@ -181,10 +189,10 @@ void probe_init(uint32_t probeId) {
     if (probes[probeId].clkPin == -1 || probes[probeId].dioPin == -1)
         return;
 
+    SemaphoreHandle_t mutex = pio_mutex[pio_get_index(probes[probeId].pio)];
+    if (mutex) xSemaphoreTake(mutex, portMAX_DELAY);
+    // initted check inside mutex closes window vs concurrent probe_init/deinit on the same PIO.
     if (!probes[probeId].initted) {
-        SemaphoreHandle_t mutex = pio_mutex[pio_get_index(probes[probeId].pio)];
-        if (mutex) xSemaphoreTake(mutex, portMAX_DELAY);
-        // Check-then-add must be atomic; pio_add_program returns (uint)-1 on OOM.
         if (!pio_can_add_program(probes[probeId].pio, &probe_program)) {
             if (mutex) xSemaphoreGive(mutex);
             probe_info("probe_init: PIO%d instruction memory exhausted, probe %d not initted\n",
@@ -192,7 +200,6 @@ void probe_init(uint32_t probeId) {
             return;
         }
         uint offset = pio_add_program(probes[probeId].pio, &probe_program);
-        if (mutex) xSemaphoreGive(mutex);
         probes[probeId].offset = offset;
 
         pio_sm_config sm_config = probe_program_get_default_config(offset);
@@ -207,28 +214,25 @@ void probe_init(uint32_t probeId) {
         pio_sm_set_enabled(probes[probeId].pio, probes[probeId].sm, 1);
         probes[probeId].initted = 1;
     }
+    if (mutex) xSemaphoreGive(mutex);
 }
 
 void probe_deinit(uint32_t probeId)
 {
   assert(probeId < MAX_DAP_PROBES);
+  SemaphoreHandle_t mutex = pio_mutex[pio_get_index(probes[probeId].pio)];
+  if (mutex) xSemaphoreTake(mutex, portMAX_DELAY);
   if (probes[probeId].initted) {
     probe_read_mode(probeId);
     pio_sm_set_enabled(probes[probeId].pio, probes[probeId].sm, 0);
-
-    SemaphoreHandle_t mutex = pio_mutex[pio_get_index(probes[probeId].pio)];
-    if (mutex) xSemaphoreTake(mutex, portMAX_DELAY);
     pio_remove_program(probes[probeId].pio, &probe_program, probes[probeId].offset);
-    if (mutex) xSemaphoreGive(mutex);
-
     probe_assert_reset(probeId, 1);	// de-assert nRESET
-
     // CMSIS-DAP requires SWCLK/SWDIO HiZ when disconnected; SM disable alone
     // leaves the pads in whatever direction the last transaction set.
     probe_gpio_deinit(probes[probeId].pio, probes[probeId].clkPin, probes[probeId].dioPin);
-
     probes[probeId].initted = 0;
   }
+  if (mutex) xSemaphoreGive(mutex);
 }
 
 void probe_led_init()

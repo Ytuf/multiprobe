@@ -1598,7 +1598,7 @@ static uint32_t DAP_SWD_WriteAbort(uint32_t probeId, const uint8_t *request, uin
 //   response: pointer to response data
 //   return:   number of bytes in response
 #if (DAP_JTAG != 0)
-static uint32_t DAP_JTAG_WriteAbort(const uint8_t *request, uint8_t *response) {
+static uint32_t DAP_JTAG_WriteAbort(uint32_t probeId, const uint8_t *request, uint8_t *response) {
   uint32_t data;
 
   // Device index (JTAP TAP)
@@ -1642,7 +1642,7 @@ static uint32_t DAP_WriteAbort(uint32_t probeId, const uint8_t *request, uint8_t
 #endif
 #if (DAP_JTAG != 0)
     case DAP_PORT_JTAG:
-      num = DAP_JTAG_WriteAbort(request, response);
+      num = DAP_JTAG_WriteAbort(probeId, request, response);
       break;
 #endif
     default:

@@ -37,8 +37,8 @@ typedef struct DAPEndpointState
 
 	volatile uint16_t resp_lens[DAP_PACKET_COUNT];
 
-	uint8_t _out_ep_addr;
-	uint8_t _in_ep_addr;
+	volatile uint8_t _out_ep_addr;
+	volatile uint8_t _in_ep_addr;
 
 	buffer_t USBRequestBuffer;
 	buffer_t USBResponseBuffer;
