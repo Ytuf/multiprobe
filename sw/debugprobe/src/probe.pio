@@ -73,6 +73,8 @@ public read_cmd:
 
 static inline void probe_gpio_init(PIO pio, int clkPin, int dioPin)
 {
+    if(clkPin == -1 || dioPin == -1)
+        return;
 #if defined(PROBE_PIN_RESET)
     // Target reset pin: pull up, input to emulate open drain pin
     gpio_pull_up(PROBE_PIN_RESET);
@@ -90,6 +92,8 @@ static inline void probe_gpio_init(PIO pio, int clkPin, int dioPin)
 // DAP interface says all pins have to be High-Z when disabled
 static inline void probe_gpio_deinit(PIO pio, int clkPin, int dioPin)
 {
+	if(clkPin == -1 || dioPin == -1)
+		return;
 	gpio_deinit(clkPin);
 	gpio_disable_pulls(clkPin);
 	gpio_deinit(dioPin);
@@ -97,6 +101,8 @@ static inline void probe_gpio_deinit(PIO pio, int clkPin, int dioPin)
 }
 
 static inline void probe_sm_init(pio_sm_config* sm_config, PIO pio, int sm, int clkPin, int dioPin ) {
+    if(clkPin == -1 || dioPin == -1)
+        return;
 
     // Set SWCLK as a sideset pin
     sm_config_set_sideset_pins(sm_config, clkPin);

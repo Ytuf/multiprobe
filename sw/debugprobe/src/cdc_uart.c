@@ -125,10 +125,15 @@ void cdc_uart_init(struct CDCUartInstance_t* uart, const struct UartProfile_t* p
   uart->rxPin = profile->rxPin;
   uart->txPin = profile->txPin;
 
-  memset(uart->matchKeyStates, 0, sizeof(uart->matchKeyStates)); 
+  memset(uart->matchKeyStates, 0, sizeof(uart->matchKeyStates));
+  if(uart->rxPin == -1 || uart->txPin == -1)
+  {
+    unlock_hw_uart();
+    return;
+  }
   gpio_set_function(uart->rxPin, GPIO_FUNC_UART);
   gpio_set_function(uart->txPin, GPIO_FUNC_UART);
-  gpio_set_pulls(uart->rxPin, 1, 0);   
+  gpio_set_pulls(uart->rxPin, 1, 0);
   uart_init(uart->uart, uart->baud);
 
 #ifdef PROBE_UART_HWFC

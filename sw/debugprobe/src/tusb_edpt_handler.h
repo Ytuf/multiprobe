@@ -32,7 +32,7 @@ typedef struct DAPEndpointState
 	uint8_t itf_num;
 	uint8_t _rhport;
 
-	volatile uint32_t _resp_len;
+	volatile uint16_t resp_lens[DAP_PACKET_COUNT];
 
 	uint8_t _out_ep_addr;
 	uint8_t _in_ep_addr;

@@ -29,6 +29,7 @@ void cdc_activate_profile( int uartId, int profileId );
 #include "task.h"
 
 #include "hardware/clocks.h"
+#include "hardware/i2c.h"
 #include <pico/stdlib.h>
 #include <pico/multicore.h>
 #include <stdio.h>
@@ -62,41 +63,22 @@ void cdc_activate_profile( int uartId, int profileId );
   #error "freeRtos not configMAX_PRIORITIES not configured"
 #endif
 
-TaskHandle_t dap_taskhandle, tud_taskhandle, mon_taskhandle, uart_taskHandle;
+TaskHandle_t tud_taskhandle, uart_taskHandle;
 uint8_t cdcArg0 = 0;
 uint8_t cdcArg1 = 1;
 extern SemaphoreHandle_t globalMutex;
 
 static int was_configured;
 
-void dev_mon(void *ptr)
-{
-    uint32_t sof[3];
-    int i = 0;
-    TickType_t wake;
-    wake = xTaskGetTickCount();
-    do {
-        /* ~5 SOF events per tick */
-        xTaskDelayUntil(&wake, 100);
-        if (tud_connected() && !tud_suspended()) {
-            sof[i++] = usb_hw->sof_rd & USB_SOF_RD_BITS;
-            i = i % 3;
-        } else {
-            for (i = 0; i < 3; i++)
-                sof[i] = 0;
-        }
-        if ((sof[0] | sof[1] | sof[2]) != 0) {
-            if ((sof[0] == sof[1]) && (sof[1] == sof[2])) {
-                probe_info("Watchdog timeout! Resetting USBD\n");
-                /* uh oh, signal disconnect (implicitly resets the controller) */
-                tud_deinit(0);
-                /* Make sure the port got the message */
-                xTaskDelayUntil(&wake, 1);
-                tud_init(0);
-            }
-        }
-    } while (1);
-}
+/*
+ * Fix #6: SOF watchdog (dev_mon) removed. The previous implementation tore
+ * down and re-initialized the tinyUSB stack after only ~15ms (3 samples *
+ * 100 ticks at configTICK_RATE_HZ=20000) of identical SOF reads, which fired
+ * on normal hub jitter and ran with no coordination against the per-probe
+ * dap_thread tasks -- leaving them holding stale endpoint/buffer state into
+ * a freshly-reinitialized stack. tinyUSB already handles bus events; this
+ * hand-rolled watchdog caused more wedges than it prevented.
+ */
 
 
 void usb_thread(void *ptr)
@@ -139,15 +121,42 @@ void usb_thread(void *ptr)
 int main(void) 
 {
     // startup flash
+#ifdef PROBE_USB_CONNECTED_LED
     gpio_init(PROBE_USB_CONNECTED_LED);
-    gpio_set_dir(PROBE_USB_CONNECTED_LED, GPIO_OUT);    
+    gpio_set_dir(PROBE_USB_CONNECTED_LED, GPIO_OUT);
     gpio_put(PROBE_USB_CONNECTED_LED,1);
+#endif
 
     probe_led_init();
     cdc_led_init();
 
     set_sys_clock_khz(252000, true);
     sleep_ms(100);
+
+    // Board status LED (GPIO2) - solid on
+    gpio_init(BOARD_LED_PIN);
+    gpio_set_dir(BOARD_LED_PIN, GPIO_OUT);
+    gpio_put(BOARD_LED_PIN, 1);
+
+    // PIC MCLR pull (GPIO3): input with internal pull-up. Pin is not actively
+    // driven -- it idles high via the pull and can be yanked low externally.
+    gpio_init(PIC_MCLR_PULL_PIN);
+    gpio_set_dir(PIC_MCLR_PULL_PIN, GPIO_IN);
+    gpio_pull_up(PIC_MCLR_PULL_PIN);
+
+    // I2C0 -> PROM (GPIO0/1)
+    i2c_init(PROM_I2C_INSTANCE, 100 * 1000);
+    gpio_set_function(PROM_I2C_SDA_PIN, GPIO_FUNC_I2C);
+    gpio_set_function(PROM_I2C_SCL_PIN, GPIO_FUNC_I2C);
+    gpio_pull_up(PROM_I2C_SDA_PIN);
+    gpio_pull_up(PROM_I2C_SCL_PIN);
+
+    // I2C1 -> PROM1 (GPIO18/19)
+    i2c_init(PROM1_I2C_INSTANCE, 100 * 1000);
+    gpio_set_function(PROM1_I2C_SDA_PIN, GPIO_FUNC_I2C);
+    gpio_set_function(PROM1_I2C_SCL_PIN, GPIO_FUNC_I2C);
+    gpio_pull_up(PROM1_I2C_SDA_PIN);
+    gpio_pull_up(PROM1_I2C_SCL_PIN);
 
     globalMutex = xSemaphoreCreateMutex();
 
@@ -171,9 +180,7 @@ int main(void)
 
     if (THREADED) {
         xTaskCreate(usb_thread, "TUD", configMINIMAL_STACK_SIZE, NULL, TUD_TASK_PRIO, &tud_taskhandle);
-#if PICO_RP2040
-        xTaskCreate(dev_mon, "WDOG", configMINIMAL_STACK_SIZE, NULL, TUD_TASK_PRIO, &mon_taskhandle);
-#endif        
+        /* Fix #6: SOF watchdog task (dev_mon) removed -- see comment above. */
         xTaskCreate(cdc_uart_core2, "UART", configMINIMAL_STACK_SIZE, NULL, HWUART_TASK_PRIO, &uart_taskHandle);
 
         vTaskStartScheduler();
@@ -230,8 +237,14 @@ void tud_suspend_cb(bool remote_wakeup_en)
     {
       if(uartDevices[i].isConfigured)
   	    vTaskSuspend(uartDevices[i].uart_taskHandle);
-    }  
-	  vTaskSuspend(dap_taskhandle);
+    }
+    /* Fix #1: suspend each per-probe dap_thread (handles live in ep_states), not a NULL global. */
+    for(int i=0;i<MAX_DAP_PROBES;i++)
+    {
+      DAPEndpointState* state = getEndpointStateByIndex(i);
+      if(state->dap_taskhandle != NULL)
+        vTaskSuspend(state->dap_taskhandle);
+    }
   }
   /* slow down clk_sys for power saving ? */
 }
@@ -244,8 +257,14 @@ void tud_resume_cb(void)
     {
       if(uartDevices[i].isConfigured)
   	    vTaskResume(uartDevices[i].uart_taskHandle);
-    } 
-	  vTaskResume(dap_taskhandle);
+    }
+    /* Fix #1: resume each per-probe dap_thread, not a NULL global. */
+    for(int i=0;i<MAX_DAP_PROBES;i++)
+    {
+      DAPEndpointState* state = getEndpointStateByIndex(i);
+      if(state->dap_taskhandle != NULL)
+        vTaskResume(state->dap_taskhandle);
+    }
   }
 }
 
@@ -254,26 +273,40 @@ void tud_unmount_cb(void)
   probe_info("Disconnected\n");
   for(int i=0;i<MAX_UART_DEVICES;i++)
   {
-    if(uartDevices[i].isConfigured)      
+    if(uartDevices[i].isConfigured)
       vTaskSuspend(uartDevices[i].uart_taskHandle);
   }
-  vTaskSuspend(dap_taskhandle);
+  /* Fix #1: suspend then delete each per-probe dap_thread; clear handles so tud_mount_cb can recreate. */
+  for(int i=0;i<MAX_DAP_PROBES;i++)
+  {
+    DAPEndpointState* state = getEndpointStateByIndex(i);
+    if(state->dap_taskhandle != NULL)
+      vTaskSuspend(state->dap_taskhandle);
+  }
   for(int i=0;i<MAX_UART_DEVICES;i++)
   {
-    if(uartDevices[i].isConfigured)      
+    if(uartDevices[i].isConfigured)
       vTaskDelete(uartDevices[i].uart_taskHandle);
   }
-  vTaskDelete(dap_taskhandle);
+  for(int i=0;i<MAX_DAP_PROBES;i++)
+  {
+    DAPEndpointState* state = getEndpointStateByIndex(i);
+    if(state->dap_taskhandle != NULL)
+    {
+      vTaskDelete(state->dap_taskhandle);
+      state->dap_taskhandle = NULL;
+    }
+  }
   was_configured = 0;
 }
 
 
 void tud_mount_cb(void)
-{  
+{
   if (!was_configured) {
     /* UART needs to preempt USB as if we don't, characters get lost */
 
-    for(int i=0;i<MAX_UART_DEVICES;i++)    
+    for(int i=0;i<MAX_UART_DEVICES;i++)
     {
       if(uartDevices[i].isConfigured)
       {
@@ -281,16 +314,21 @@ void tud_mount_cb(void)
         {
         case EUartType_Hardware:
           xTaskCreate(cdc_uart_thread, uartDevices[i].name, configMINIMAL_STACK_SIZE, &uartDevices[i], UART_TASK_PRIO, &uartDevices[i].uart_taskHandle);
-          break;                          
+          break;
         default:
           break;
-        }        
+        }
       }
-    }   
+    }
 
-    /* Lowest priority thread is debug - need to shuffle buffers before we can toggle swd... */    
+    /* Lowest priority thread is debug - need to shuffle buffers before we can toggle swd... */
+    /* Fix #1: only create a per-probe dap_thread if one isn't already alive (tud_unmount_cb clears the handle). */
     for(int i=0;i<MAX_DAP_PROBES;i++)
-      xTaskCreate(dap_thread, "DAP.x", configMINIMAL_STACK_SIZE, getEndpointStateByIndex(i), DAP_TASK_PRIO, &getEndpointStateByIndex(i)->dap_taskhandle);   
+    {
+      DAPEndpointState* state = getEndpointStateByIndex(i);
+      if(state->dap_taskhandle == NULL)
+        xTaskCreate(dap_thread, "DAP.x", configMINIMAL_STACK_SIZE, state, DAP_TASK_PRIO, &state->dap_taskhandle);
+    }
 
     was_configured = 1;
   }

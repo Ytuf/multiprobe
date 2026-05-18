@@ -90,7 +90,7 @@ char * dap_cmd_string[] = {
 };
 
 
-uint16_t dap_edpt_open(uint8_t __unused rhport, tusb_desc_interface_t const *itf_desc, uint16_t max_len)
+uint16_t dap_edpt_open(uint8_t rhport, tusb_desc_interface_t const *itf_desc, uint16_t max_len)
 {
 
 	TU_VERIFY(TUSB_CLASS_VENDOR_SPECIFIC == itf_desc->bInterfaceClass &&
@@ -101,6 +101,9 @@ uint16_t dap_edpt_open(uint8_t __unused rhport, tusb_desc_interface_t const *itf
 		return 0;
 
 	struct DAPEndpointState* state = &ep_states[itf_desc->bInterfaceNumber];
+
+	// Record the root hub port so later usbd_edpt_xfer calls target the right controller
+	state->_rhport = rhport;
 
 	//  Initialise circular buffer indices
 	state->USBResponseBuffer.wptr = 0;
@@ -171,12 +174,13 @@ bool dap_edpt_xfer_cb(uint8_t __unused rhport, uint8_t ep_addr, xfer_result_t re
 			// so we account for this by only setting wasEmpty to true if the next callback will empty the buffer
 			if(!state->USBResponseBuffer.wasEmpty)
 			{
-				usbd_edpt_xfer(rhport, ep_addr, RD_SLOT_PTR(state->USBResponseBuffer), (uint16_t) state->_resp_len);
+				uint16_t slot_len = state->resp_lens[RD_IDX(state->USBResponseBuffer)];
+				usbd_edpt_xfer(rhport, ep_addr, RD_SLOT_PTR(state->USBResponseBuffer), slot_len);
 				state->USBResponseBuffer.wasEmpty = (state->USBResponseBuffer.rptr + 1) == state->USBResponseBuffer.wptr;
 			}
 
 			//  Wake up DAP thread after processing the callback
-			vTaskResume(state->dap_taskhandle);
+			xTaskNotifyGive(state->dap_taskhandle);
 			return true;
 		}
 
@@ -199,7 +203,7 @@ bool dap_edpt_xfer_cb(uint8_t __unused rhport, uint8_t ep_addr, xfer_result_t re
 			}
 
 			//  Wake up DAP thread after processing the callback
-			vTaskResume(state->dap_taskhandle);
+			xTaskNotifyGive(state->dap_taskhandle);
 			return true;
 		}
 
@@ -230,7 +234,7 @@ void dap_thread(void *ptr)
 				while (n == state->USBRequestBuffer.wptr) {
 					/* Need yield in a loop here, as IN callbacks will also wake the thread */
 					probe_info("DAP wait\n");
-					vTaskSuspend(state->dap_taskhandle);
+					ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 				}
 			}
 			// Read a single packet from the USB buffer into the DAP Request buffer
@@ -250,7 +254,7 @@ void dap_thread(void *ptr)
 				xTaskResumeAll();
 			}
 
-			state->_resp_len = DAP_ExecuteCommand(state->probeId, state->DAPRequestBuffer, state->DAPResponseBuffer);
+			uint32_t resp_len = DAP_ExecuteCommand(state->probeId, state->DAPRequestBuffer, state->DAPResponseBuffer);
 			/*probe_info("%lu %lu DAP resp %s\n",
 					USBResponseBuffer.wptr, USBResponseBuffer.rptr,
 					dap_cmd_string[DAPResponseBuffer[0]]);*/
@@ -259,15 +263,19 @@ void dap_thread(void *ptr)
 			//  Suspend the scheduler to avoid stale values/race conditions between threads
 			vTaskSuspendAll();
 
+			// Compute the slot index BEFORE bumping wptr so the IN-callback consumer
+			// can read the matching length from resp_lens[] for the slot it is sending.
+			uint32_t wr_slot = WR_IDX(state->USBResponseBuffer);
+			memcpy(&state->USBResponseBuffer.data[wr_slot][0], state->DAPResponseBuffer, (uint16_t) resp_len);
+			state->resp_lens[wr_slot] = (uint16_t) resp_len;
+
 			if(buffer_empty(&state->USBResponseBuffer))
 			{
-				memcpy(WR_SLOT_PTR(state->USBResponseBuffer), state->DAPResponseBuffer, (uint16_t) state->_resp_len);
 				state->USBResponseBuffer.wptr++;
 
-				usbd_edpt_xfer(state->_rhport, state->_in_ep_addr, RD_SLOT_PTR(state->USBResponseBuffer), (uint16_t) state->_resp_len);
+				usbd_edpt_xfer(state->_rhport, state->_in_ep_addr, &state->USBResponseBuffer.data[wr_slot][0], (uint16_t) resp_len);
 			} else {
 
-				memcpy(WR_SLOT_PTR(state->USBResponseBuffer), state->DAPResponseBuffer, (uint16_t) state->_resp_len);
 				state->USBResponseBuffer.wptr++;
 
 				// The In callback needs to check this flag to know when to queue up the next buffer.
@@ -277,7 +285,7 @@ void dap_thread(void *ptr)
 		}
 
 		// Suspend DAP thread until it is awoken by a USB thread callback
-		vTaskSuspend(state->dap_taskhandle);
+		ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
 	} while (1);
 

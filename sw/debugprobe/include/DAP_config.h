@@ -318,11 +318,11 @@ Configures the DAP Hardware I/O pins for Serial Wire Debug (SWD) mode:
  - SWCLK, SWDIO, nRESET to output mode and set to default high level.
  - TDI, nTRST to HighZ mode (pins are unused in SWD mode).
 */
-// hack - zap our "stop doing divides everywhere" cache
-extern volatile uint32_t cached_delay;
+// hack - zap our "stop doing divides everywhere" cache.
+// Fix #10: cache is per-probe now; reset only this probe's slot.
 __STATIC_INLINE void PORT_SWD_SETUP (uint32_t probeId) {
   probe_init(probeId);
-  cached_delay = 0;
+  probes[probeId].cached_delay = 0;
 }
 
 /** Disable JTAG/SWD I/O Pins.
@@ -462,23 +462,26 @@ __STATIC_FORCEINLINE void     PIN_nTRST_OUT  (uint32_t bit) {
 /** nRESET I/O pin: Get Input.
 \return Current status of the nRESET DAP hardware I/O pin.
 */
-__STATIC_FORCEINLINE uint32_t PIN_nRESET_IN  (void) {
+__STATIC_FORCEINLINE uint32_t PIN_nRESET_IN  (uint32_t probeId) {
 #ifdef PROBE_PIN_RESET
-  return probe_reset_level();
+  return probe_reset_level(probeId);
 #else
+  (void) probeId;
   return (0U);
 #endif
 }
 
 /** nRESET I/O pin: Set Output.
+\param probeId per-probe context.
 \param bit target device hardware reset pin status:
            - 0: issue a device hardware reset.
            - 1: release device hardware reset.
 */
-__STATIC_FORCEINLINE void     PIN_nRESET_OUT (uint32_t bit) {
+__STATIC_FORCEINLINE void     PIN_nRESET_OUT (uint32_t probeId, uint32_t bit) {
 #ifdef PROBE_PIN_RESET
-  probe_assert_reset(!!bit);
+  probe_assert_reset(probeId, !!bit);
 #else
+  (void) probeId;
   (void) bit;
 #endif
 }

@@ -295,7 +295,7 @@ static uint32_t DAP_SWJ_Pins(uint32_t probeId, const uint8_t *request, uint8_t *
     PIN_nTRST_OUT(value >> DAP_SWJ_nTRST);
   }
   if ((select & (1U << DAP_SWJ_nRESET)) != 0U){
-    PIN_nRESET_OUT(value >> DAP_SWJ_nRESET);
+    PIN_nRESET_OUT(probeId, value >> DAP_SWJ_nRESET);
   }
 
   if (wait != 0U) {
@@ -334,7 +334,7 @@ static uint32_t DAP_SWJ_Pins(uint32_t probeId, const uint8_t *request, uint8_t *
         }
       }
       if ((select & (1U << DAP_SWJ_nRESET)) != 0U) {
-        if ((value >> DAP_SWJ_nRESET) ^ PIN_nRESET_IN()) {
+        if ((value >> DAP_SWJ_nRESET) ^ PIN_nRESET_IN(probeId)) {
           continue;
         }
       }
@@ -347,7 +347,7 @@ static uint32_t DAP_SWJ_Pins(uint32_t probeId, const uint8_t *request, uint8_t *
           (PIN_TDI_IN()       << DAP_SWJ_TDI)       |
           (PIN_TDO_IN()       << DAP_SWJ_TDO)       |
           (PIN_nTRST_IN()     << DAP_SWJ_nTRST)     |
-          (PIN_nRESET_IN()    << DAP_SWJ_nRESET);
+          (PIN_nRESET_IN(probeId) << DAP_SWJ_nRESET);
 
   *response = (uint8_t)value;
 #else
@@ -660,6 +660,7 @@ static uint32_t DAP_SWD_Transfer(uint32_t probeId, const uint8_t *request, uint8
   uint32_t  request_count;
   uint32_t  request_value;
   uint8_t  *response_head;
+  uint8_t  *response_limit;
   uint32_t  response_count;
   uint32_t  response_value;
   uint32_t  post_read;
@@ -677,6 +678,7 @@ static uint32_t DAP_SWD_Transfer(uint32_t probeId, const uint8_t *request, uint8
   response_count = 0U;
   response_value = 0U;
   response_head  = response;
+  response_limit = response_head + DAP_PACKET_SIZE;
   response      += 2;
 
   DAP_TransferAbort[probeId] = 0U;
@@ -690,6 +692,14 @@ static uint32_t DAP_SWD_Transfer(uint32_t probeId, const uint8_t *request, uint8
 
   for (; request_count != 0U; request_count--) {
     request_value = *request++;
+    // Worst-case bytes one iteration can write into the response buffer:
+    //   post_read drain: 4 (data) [+ 4 (timestamp) if TS-tagged]
+    //   new transfer:    up to 4 (data) [+ 4 (timestamp) if TS-tagged]
+    // Bail out early if we cannot guarantee space, so the response is well-formed
+    // and the host learns from response_count how many transfers actually completed.
+    if ((response + 16U) > response_limit) {
+      break;
+    }
     if ((request_value & DAP_TRANSFER_RnW) != 0U) {
       // Read register
       if (post_read) {
@@ -894,11 +904,13 @@ static uint32_t DAP_SWD_Transfer(uint32_t probeId, const uint8_t *request, uint8
       if (response_value != DAP_TRANSFER_OK) {
         goto end;
       }
-      // Store previous data
-      *response++ = (uint8_t) data;
-      *response++ = (uint8_t)(data >>  8);
-      *response++ = (uint8_t)(data >> 16);
-      *response++ = (uint8_t)(data >> 24);
+      // Store previous data (only if it fits; otherwise drop the trailing word)
+      if ((response + 4U) <= response_limit) {
+        *response++ = (uint8_t) data;
+        *response++ = (uint8_t)(data >>  8);
+        *response++ = (uint8_t)(data >> 16);
+        *response++ = (uint8_t)(data >> 24);
+      }
     } else if (check_write) {
       // Check last write
       retry = DAP_Data[probeId].transfer.retry_count;
@@ -918,18 +930,29 @@ end:
 
 
 // Process JTAG Transfer command and prepare response
+//   probeId:  per-probe context (this file is multi-probe; JTAG_DP.c is NOT).
 //   request:  pointer to request data
 //   response: pointer to response data
 //   return:   number of bytes in response (lower 16 bits)
 //             number of bytes in request (upper 16 bits)
+//
+// NOTE: This dispatcher correctly accepts probeId, but the low-level
+// JTAG_DP.c helpers it calls (JTAG_Transfer, JTAG_IR, JTAG_ReadIDCode,
+// JTAG_WriteAbort, JTAG_Sequence) do NOT take probeId and were never
+// converted to be multi-probe-aware. Enabling DAP_JTAG=1 against more than
+// one probe would route every JTAG call to the same (effectively hardcoded)
+// hardware. A proper fix requires a PIO-backed per-probe JTAG implementation
+// analogous to sw_dp_pio.c for SWD. Until then, DAP_JTAG must stay 0 on
+// this firmware.
 #if (DAP_JTAG != 0)
-static uint32_t DAP_JTAG_Transfer(const uint8_t *request, uint8_t *response) {
+static uint32_t DAP_JTAG_Transfer(uint32_t probeId, const uint8_t *request, uint8_t *response) {
   const
   uint8_t  *request_head;
   uint32_t  request_count;
   uint32_t  request_value;
   uint32_t  request_ir;
   uint8_t  *response_head;
+  uint8_t  *response_limit;
   uint32_t  response_count;
   uint32_t  response_value;
   uint32_t  post_read;
@@ -947,6 +970,7 @@ static uint32_t DAP_JTAG_Transfer(const uint8_t *request, uint8_t *response) {
   response_count = 0U;
   response_value = 0U;
   response_head  = response;
+  response_limit = response_head + DAP_PACKET_SIZE;
   response      += 2;
 
   DAP_TransferAbort[probeId] = 0U;
@@ -964,6 +988,11 @@ static uint32_t DAP_JTAG_Transfer(const uint8_t *request, uint8_t *response) {
 
   for (; request_count != 0U; request_count--) {
     request_value = *request++;
+    // Bail out if remaining response space cannot accommodate worst-case
+    // iteration writes (post_read drain + new transfer, both potentially TS-tagged).
+    if ((response + 16U) > response_limit) {
+      break;
+    }
     request_ir = (request_value & DAP_TRANSFER_APnDP) ? JTAG_APACC : JTAG_DPACC;
     if ((request_value & DAP_TRANSFER_RnW) != 0U) {
       // Read register
@@ -1169,11 +1198,13 @@ static uint32_t DAP_JTAG_Transfer(const uint8_t *request, uint8_t *response) {
       if (response_value != DAP_TRANSFER_OK) {
         goto end;
       }
-      // Store previous data
-      *response++ = (uint8_t) data;
-      *response++ = (uint8_t)(data >>  8);
-      *response++ = (uint8_t)(data >> 16);
-      *response++ = (uint8_t)(data >> 24);
+      // Store previous data (only if it fits; otherwise drop the trailing word)
+      if ((response + 4U) <= response_limit) {
+        *response++ = (uint8_t) data;
+        *response++ = (uint8_t)(data >>  8);
+        *response++ = (uint8_t)(data >> 16);
+        *response++ = (uint8_t)(data >> 24);
+      }
     } else {
       // Check last write
       retry = DAP_Data[probeId].transfer.retry_count;
@@ -1270,12 +1301,14 @@ static uint32_t DAP_SWD_TransferBlock(uint32_t probeId, const uint8_t *request, 
   uint32_t  response_count;
   uint32_t  response_value;
   uint8_t  *response_head;
+  uint8_t  *response_limit;
   uint32_t  retry;
   uint32_t  data;
 
   response_count = 0U;
   response_value = 0U;
   response_head  = response;
+  response_limit = response_head + DAP_PACKET_SIZE;
   response      += 3;
 
   DAP_TransferAbort[probeId] = 0U;
@@ -1303,6 +1336,11 @@ static uint32_t DAP_SWD_TransferBlock(uint32_t probeId, const uint8_t *request, 
       }
     }
     while (request_count--) {
+      // Stop early if storing another word would overflow the response buffer.
+      // Per CMSIS-DAP, the host learns from response_count how many transfers actually completed.
+      if ((response + 4U) > response_limit) {
+        break;
+      }
       // Read DP/AP register
       if ((request_count == 0U) && ((request_value & DAP_TRANSFER_APnDP) != 0U)) {
         // Last AP read
@@ -1363,12 +1401,13 @@ end:
 //   response: pointer to response data
 //   return:   number of bytes in response
 #if (DAP_JTAG != 0)
-static uint32_t DAP_JTAG_TransferBlock(const uint8_t *request, uint8_t *response) {
+static uint32_t DAP_JTAG_TransferBlock(uint32_t probeId, const uint8_t *request, uint8_t *response) {
   uint32_t  request_count;
   uint32_t  request_value;
   uint32_t  response_count;
   uint32_t  response_value;
   uint8_t  *response_head;
+  uint8_t  *response_limit;
   uint32_t  retry;
   uint32_t  data;
   uint32_t  ir;
@@ -1376,6 +1415,7 @@ static uint32_t DAP_JTAG_TransferBlock(const uint8_t *request, uint8_t *response
   response_count = 0U;
   response_value = 0U;
   response_head  = response;
+  response_limit = response_head + DAP_PACKET_SIZE;
   response      += 3;
 
   DAP_TransferAbort[probeId] = 0U;
@@ -1410,6 +1450,11 @@ static uint32_t DAP_JTAG_TransferBlock(const uint8_t *request, uint8_t *response
     }
     // Read register block
     while (request_count--) {
+      // Stop early if storing another word would overflow the response buffer.
+      // Per CMSIS-DAP, the host learns from response_count how many transfers actually completed.
+      if ((response + 4U) > response_limit) {
+        break;
+      }
       // Read DP/AP register
       if (request_count == 0U) {
         // Last read
@@ -1487,7 +1532,7 @@ static uint32_t DAP_TransferBlock(uint32_t probeId, const uint8_t *request, uint
 #endif
 #if (DAP_JTAG != 0)
     case DAP_PORT_JTAG:
-      num = DAP_JTAG_TransferBlock(request, response);
+      num = DAP_JTAG_TransferBlock(probeId, request, response);
       break;
 #endif
     default:

@@ -32,7 +32,11 @@
 /* Slight hack - we're not bitbashing so we need to set baudrate off the DAP's delay cycles.
  * Ideally we don't want calls to udiv everywhere... */
 #define MAKE_KHZ(x) (CPU_CLOCK / (2000 * ((x) + 1)))
-volatile uint32_t cached_delay = 0;
+
+/* Fix #10: cached_delay was previously a single global volatile uint32_t.
+ * With multiple probes running concurrently at potentially different SWCLK
+ * rates the cache was wrong for any probe but the most-recently-configured
+ * one. Per-probe state now lives in probes[probeId].cached_delay. */
 
 // Generate SWJ Sequence
 //   count:  sequence bit count
@@ -43,9 +47,9 @@ void SWJ_Sequence (uint32_t probeId, uint32_t count, const uint8_t *data) {
   uint32_t bits;
   uint32_t n;
 
-  if (DAP_Data[probeId].clock_delay != cached_delay) {
+  if (DAP_Data[probeId].clock_delay != probes[probeId].cached_delay) {
     probe_set_swclk_freq(probeId, MAKE_KHZ(DAP_Data[probeId].clock_delay));
-    cached_delay = DAP_Data[probeId].clock_delay;
+    probes[probeId].cached_delay = DAP_Data[probeId].clock_delay;
   }
   probe_debug("SWJ sequence count = %d FDB=0x%2x\n", count, data[0]);
   n = count;
@@ -70,9 +74,9 @@ void SWD_Sequence (uint32_t probeId, uint32_t info, const uint8_t *swdo, uint8_t
   uint32_t bits;
   uint32_t n;
 
-  if (DAP_Data[probeId].clock_delay != cached_delay) {
+  if (DAP_Data[probeId].clock_delay != probes[probeId].cached_delay) {
     probe_set_swclk_freq(probeId, MAKE_KHZ(DAP_Data[probeId].clock_delay));
-    cached_delay = DAP_Data[probeId].clock_delay;
+    probes[probeId].cached_delay = DAP_Data[probeId].clock_delay;
   }
   probe_debug("SWD sequence\n");
   n = info & SWD_SEQUENCE_CLK;
@@ -115,9 +119,9 @@ uint8_t SWD_Transfer (uint32_t probeId, uint32_t request, uint32_t *data) {
   uint32_t parity = 0;
   uint32_t n;
 
-  if (DAP_Data[probeId].clock_delay != cached_delay) {
+  if (DAP_Data[probeId].clock_delay != probes[probeId].cached_delay) {
     probe_set_swclk_freq(probeId, MAKE_KHZ(DAP_Data[probeId].clock_delay));
-    cached_delay = DAP_Data[probeId].clock_delay;
+    probes[probeId].cached_delay = DAP_Data[probeId].clock_delay;
   }
   probe_debug("SWD_transfer\n");
   /* Generate the request packet */

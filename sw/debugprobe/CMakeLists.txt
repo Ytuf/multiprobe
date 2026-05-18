@@ -14,10 +14,10 @@ if (EXISTS ${picoVscode})
     include(${picoVscode})
 endif()
 # ====================================================================================
-set(PICO_BOARD pico2 CACHE STRING "Board type")
+set(PICO_BOARD pico CACHE STRING "Board type")
 
 add_compile_definitions(DEBUG_ON_PICO=1)
-add_compile_definitions(PICO_PLATFORM=rp2350)
+add_compile_definitions(PICO_PLATFORM=rp2040)
 
 
 cmake_minimum_required(VERSION 3.12)
@@ -97,6 +97,7 @@ target_link_libraries(debugprobe PRIVATE
         tinyusb_device
         tinyusb_board
         hardware_pio
+        hardware_i2c
         FreeRTOS-Kernel
         FreeRTOS-Kernel-Heap1
 )

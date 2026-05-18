@@ -30,9 +30,18 @@
 #include <hardware/clocks.h>
 #include <hardware/gpio.h>
 
+#include "FreeRTOS.h"
+#include "semphr.h"
+
 #include "probe_config.h"
 #include "probe.h"
 #include "tusb.h"
+
+// Fix #7: per-PIO mutex protecting pio_add_program / pio_remove_program.
+// Pico SDK's program-allocation calls are not thread-safe and two probes
+// sharing a PIO (e.g. DISPLAY+MAIN on pio0) can race when their dap_threads
+// both Connect concurrently.
+static SemaphoreHandle_t pio_mutex[NUM_PIOS];
 
 #define DIV_ROUND_UP(m, n)	(((m) + (n) - 1) / (n))
 
@@ -50,24 +59,17 @@ CU_REGISTER_DEBUG_PINS(probe_timing)
 //CU_SELECT_DEBUG_PINS(probe_timing)
 
 #define PROBE_BUF_SIZE 8192
-struct _probe {
-    const char* name;
-    
-    // PIO offset
-    uint offset;
-    uint initted;
 
-    // swd port
-    int clkPin;
-    int dioPin;
-    PIO pio;
-    int sm;        
+// Timestamp of last SWD activity (any probe, any direction). Drives the
+// yellow "SWD active" LED. uint32 wraps every ~71 min; unsigned subtract
+// in the LED update is wrap-safe.
+static volatile uint32_t swd_last_activity_us = 0;
+#define SWD_ACT_LED_HOLD_US 100000  // hold LED on for 100ms after last edge
 
-    int activityLedPin;
-};
+// struct _probe is declared in probe.h so sw_dp_pio.c can touch
+// per-probe state (e.g. cached_delay) directly.
 
-
-static struct _probe probes[MAX_DAP_PROBES] = {
+struct _probe probes[MAX_DAP_PROBES] = {
     PROBE_CONFIG0,       // Default
     PROBE_CONFIG1,
     PROBE_CONFIG2,
@@ -134,6 +136,7 @@ void probe_write_bits(uint32_t probeId, uint bit_count, uint32_t data_byte) {
     pio_sm_put_blocking(probes[probeId].pio, probes[probeId].sm, fmt_probe_command(probeId, bit_count, true, CMD_WRITE));
     pio_sm_put_blocking(probes[probeId].pio, probes[probeId].sm, data_byte);
     probe_dump("Write %d bits 0x%x\n", bit_count, data_byte);
+    swd_last_activity_us = time_us_32();
     // Return immediately so we can cue up the next command whilst this one runs
     DEBUG_PINS_CLR(probe_timing, DBG_PIN_WRITE);
 }
@@ -155,6 +158,7 @@ uint32_t probe_read_bits(uint32_t probeId, uint bit_count) {
     }
 
     probe_dump("Read %d bits 0x%x (shifted 0x%x)\n", bit_count, data, data_shifted);
+    swd_last_activity_us = time_us_32();
     DEBUG_PINS_CLR(probe_timing, DBG_PIN_READ);
     return data_shifted;
 }
@@ -181,9 +185,16 @@ void probe_write_mode(uint32_t probeId) {
 
 void probe_init(uint32_t probeId) {
     assert(probeId < MAX_DAP_PROBES);
+    if (probes[probeId].clkPin == -1 || probes[probeId].dioPin == -1)
+        return;
 
     if (!probes[probeId].initted) {
+        // Fix #7: serialize PIO program memory mutation against the other
+        // probe sharing this PIO instance.
+        SemaphoreHandle_t mutex = pio_mutex[pio_get_index(probes[probeId].pio)];
+        if (mutex) xSemaphoreTake(mutex, portMAX_DELAY);
         uint offset = pio_add_program(probes[probeId].pio, &probe_program);
+        if (mutex) xSemaphoreGive(mutex);
         probes[probeId].offset = offset;
 
         pio_sm_config sm_config = probe_program_get_default_config(offset);
@@ -206,16 +217,39 @@ void probe_deinit(uint32_t probeId)
   if (probes[probeId].initted) {
     probe_read_mode(probeId);
     pio_sm_set_enabled(probes[probeId].pio, probes[probeId].sm, 0);
+
+    // Fix #7: serialize PIO program memory mutation.
+    SemaphoreHandle_t mutex = pio_mutex[pio_get_index(probes[probeId].pio)];
+    if (mutex) xSemaphoreTake(mutex, portMAX_DELAY);
     pio_remove_program(probes[probeId].pio, &probe_program, probes[probeId].offset);
+    if (mutex) xSemaphoreGive(mutex);
 
     probe_assert_reset(probeId, 1);	// de-assert nRESET
 
-    probes[probeId].initted = 0;  
+    // Fix #2: CMSIS-DAP spec says SWCLK/SWDIO must be HiZ when disconnected.
+    // After disabling the SM and removing the program, the pads are still
+    // assigned to the PIO function with whatever direction the last
+    // transaction left them in. Use the helper from probe.pio to return
+    // them to plain-GPIO input with pulls disabled.
+    probe_gpio_deinit(probes[probeId].pio, probes[probeId].clkPin, probes[probeId].dioPin);
+
+    probes[probeId].initted = 0;
   }
 }
 
 void probe_led_init()
 {
+    // Fix #7: create per-PIO mutexes once at boot. probe_led_init is called
+    // a single time from main() before any probe is connected, so it's a
+    // convenient one-shot init site.
+    for (int i = 0; i < NUM_PIOS; i++)
+    {
+        if (pio_mutex[i] == NULL)
+        {
+            pio_mutex[i] = xSemaphoreCreateMutex();
+        }
+    }
+
     for(int i=0;i<MAX_DAP_PROBES;i++)
     {
         struct _probe* probe = &probes[i];
@@ -223,14 +257,38 @@ void probe_led_init()
         {
             // Led off
             gpio_init(probe->activityLedPin);
-            gpio_set_dir(probe->activityLedPin, GPIO_OUT);    
-            gpio_put(probe->activityLedPin, 0);    
+            gpio_set_dir(probe->activityLedPin, GPIO_OUT);
+            gpio_put(probe->activityLedPin, 0);
         }
     }
+
+#ifdef SWD_READY_LED_PIN
+    gpio_init(SWD_READY_LED_PIN);
+    gpio_set_dir(SWD_READY_LED_PIN, GPIO_OUT);
+    gpio_put(SWD_READY_LED_PIN, 0);
+#endif
+#ifdef SWD_ACT_LED_PIN
+    gpio_init(SWD_ACT_LED_PIN);
+    gpio_set_dir(SWD_ACT_LED_PIN, GPIO_OUT);
+    gpio_put(SWD_ACT_LED_PIN, 0);
+#endif
 }
 
 void probe_led_update()
 {
+#ifdef SWD_READY_LED_PIN
+    bool any_initted = false;
+    for(int i=0;i<MAX_DAP_PROBES;i++)
+    {
+        if(probes[i].initted) { any_initted = true; break; }
+    }
+    gpio_put(SWD_READY_LED_PIN, any_initted ? 1 : 0);
+#endif
+#ifdef SWD_ACT_LED_PIN
+    uint32_t since = time_us_32() - swd_last_activity_us;
+    gpio_put(SWD_ACT_LED_PIN, (since < SWD_ACT_LED_HOLD_US) ? 1 : 0);
+#endif
+
     for(int i=0;i<MAX_DAP_PROBES;i++)
     {
         struct _probe* probe = &probes[i];
