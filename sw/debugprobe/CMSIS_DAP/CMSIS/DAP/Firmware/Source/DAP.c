@@ -81,37 +81,59 @@ static const char TargetDeviceName   [] = TARGET_DEVICE_NAME;
 // Get DAP Information
 //   id:      info identifier
 //   info:    pointer to info data
-//   return:  number of bytes in info data
-static uint8_t DAP_Info(uint8_t id, uint8_t *info) {
+//   max_len: maximum number of bytes the caller's info buffer can accept
+//           (Fix #16d: prior signature wrote up to ~60 bytes for the string
+//            IDs without consulting any caller-supplied bound; in a chained
+//            ID_DAP_ExecuteCommands batch this could overrun the 64-byte
+//            DAPResponseBuffer slot. We now stage the response in a local
+//            scratch buffer and copy at most max_len bytes back. Strings
+//            stage at min(scratch, max_len) by writing the string getter
+//            into the scratch buffer first.)
+//   return:  number of bytes written to info (always <= max_len)
+static uint8_t DAP_Info(uint8_t id, uint8_t *info, uint8_t max_len) {
   uint8_t length = 0U;
+  // Scratch buffer large enough for the worst-case DAP_Info payload (a
+  // ~60-byte CMSIS-DAP info string). Using DAP_PACKET_SIZE keeps this
+  // sized to a known protocol bound.
+  uint8_t scratch[DAP_PACKET_SIZE];
 
   switch (id) {
     case DAP_ID_VENDOR:
-      length = DAP_GetVendorString((char *)info);
+      length = DAP_GetVendorString((char *)scratch);
+      if (length > max_len) length = max_len;
+      memcpy(info, scratch, length);
       break;
     case DAP_ID_PRODUCT:
-      length = DAP_GetProductString((char *)info);
+      length = DAP_GetProductString((char *)scratch);
+      if (length > max_len) length = max_len;
+      memcpy(info, scratch, length);
       break;
     case DAP_ID_SER_NUM:
-      length = DAP_GetSerNumString((char *)info);
+      length = DAP_GetSerNumString((char *)scratch);
+      if (length > max_len) length = max_len;
+      memcpy(info, scratch, length);
       break;
     case DAP_ID_FW_VER:
       length = (uint8_t)sizeof(DAP_FW_Ver);
+      if (length > max_len) length = max_len;
       memcpy(info, DAP_FW_Ver, length);
       break;
     case DAP_ID_DEVICE_VENDOR:
 #if TARGET_DEVICE_FIXED
       length = (uint8_t)sizeof(TargetDeviceVendor);
+      if (length > max_len) length = max_len;
       memcpy(info, TargetDeviceVendor, length);
 #endif
       break;
     case DAP_ID_DEVICE_NAME:
 #if TARGET_DEVICE_FIXED
       length = (uint8_t)sizeof(TargetDeviceName);
+      if (length > max_len) length = max_len;
       memcpy(info, TargetDeviceName, length);
 #endif
       break;
     case DAP_ID_CAPABILITIES:
+      if (max_len < 1U) { length = 0U; break; }
       info[0] = ((DAP_SWD  != 0)         ? (1U << 0) : 0U) |
                 ((DAP_JTAG != 0)         ? (1U << 1) : 0U) |
                 ((SWO_UART != 0)         ? (1U << 2) : 0U) |
@@ -122,7 +144,8 @@ static uint8_t DAP_Info(uint8_t id, uint8_t *info) {
       length = 1U;
       break;
     case DAP_ID_TIMESTAMP_CLOCK:
-#if (TIMESTAMP_CLOCK != 0U) 
+#if (TIMESTAMP_CLOCK != 0U)
+      if (max_len < 4U) { length = 0U; break; }
       info[0] = (uint8_t)(TIMESTAMP_CLOCK >>  0);
       info[1] = (uint8_t)(TIMESTAMP_CLOCK >>  8);
       info[2] = (uint8_t)(TIMESTAMP_CLOCK >> 16);
@@ -132,6 +155,7 @@ static uint8_t DAP_Info(uint8_t id, uint8_t *info) {
       break;
     case DAP_ID_SWO_BUFFER_SIZE:
 #if ((SWO_UART != 0) || (SWO_MANCHESTER != 0))
+      if (max_len < 4U) { length = 0U; break; }
       info[0] = (uint8_t)(SWO_BUFFER_SIZE >>  0);
       info[1] = (uint8_t)(SWO_BUFFER_SIZE >>  8);
       info[2] = (uint8_t)(SWO_BUFFER_SIZE >> 16);
@@ -140,11 +164,13 @@ static uint8_t DAP_Info(uint8_t id, uint8_t *info) {
 #endif
       break;
     case DAP_ID_PACKET_SIZE:
+      if (max_len < 2U) { length = 0U; break; }
       info[0] = (uint8_t)(DAP_PACKET_SIZE >> 0);
       info[1] = (uint8_t)(DAP_PACKET_SIZE >> 8);
       length = 2U;
       break;
     case DAP_ID_PACKET_COUNT:
+      if (max_len < 1U) { length = 0U; break; }
       info[0] = DAP_PACKET_COUNT;
       length = 1U;
       break;
@@ -1699,9 +1725,29 @@ uint32_t DAP_ProcessCommand(uint32_t probeId, const uint8_t *request, uint8_t *r
 
   switch (*request++) {
     case ID_DAP_Info:
-      num = DAP_Info(*request, response+1);
+    {
+      /* Fix #16d: clamp the data write to the remaining per-batch response
+       * headroom so DAP_Info cannot overrun the 64-byte DAPResponseBuffer
+       * slot when invoked late in a chained ID_DAP_ExecuteCommands. Data
+       * is written at (response+1) (response[0] is the length byte); the
+       * available headroom for the data payload is the per-batch ceiling
+       * established in DAP_ExecuteCommand minus the data write address.
+       * If DAPResponseLimit is unset (a bare DAP_ProcessCommand call) we
+       * fall back to the full DAP_PACKET_SIZE budget. */
+      uint8_t *data_ptr = response + 1;
+      uint32_t headroom;
+      if (DAPResponseLimit[probeId] != NULL && DAPResponseLimit[probeId] > data_ptr) {
+        headroom = (uint32_t)(DAPResponseLimit[probeId] - data_ptr);
+      } else if (DAPResponseLimit[probeId] != NULL) {
+        headroom = 0U;
+      } else {
+        headroom = DAP_PACKET_SIZE;
+      }
+      if (headroom > 255U) headroom = 255U;  // DAP_Info length is a uint8_t
+      num = DAP_Info(*request, data_ptr, (uint8_t)headroom);
       *response = (uint8_t)num;
       return ((2U << 16) + 2U + num);
+    }
 
     case ID_DAP_HostStatus:
       num = DAP_HostStatus(probeId, request, response);

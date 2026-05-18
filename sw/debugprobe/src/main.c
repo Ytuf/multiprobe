@@ -304,6 +304,14 @@ void tud_unmount_cb(void)
     if(state->dap_taskhandle != NULL)
     {
       state->should_exit = true;
+      /* Fix #16b: if tud_suspend_cb already ran, the dap_thread is in
+       * FreeRTOS SUSPENDED state. Task notifications do NOT wake a
+       * suspended task -- only vTaskResume does. Without this resume the
+       * task stays suspended forever, never observes should_exit, never
+       * self-deletes, and the handle never goes NULL, wedging future mount
+       * cycles. Resume is a no-op (with internal critical-section safety)
+       * for a task that is not currently suspended. */
+      vTaskResume(state->dap_taskhandle);
       xTaskNotifyGive(state->dap_taskhandle);
     }
     state->_in_ep_addr = 0;
@@ -339,13 +347,24 @@ void tud_mount_cb(void)
     /* Fix #1: only create a per-probe dap_thread if one isn't already alive (tud_unmount_cb clears the handle). */
     /* Fix #11a: clear should_exit before (re)creating, so the new task
      * doesn't immediately self-delete on a stale flag from a prior
-     * teardown. */
+     * teardown.
+     * Fix #16a: clear should_exit UNCONDITIONALLY (outside the handle==NULL
+     * guard). On a fast re-enumeration the prior dap_thread may not yet have
+     * been scheduled to observe its old should_exit=true and self-delete --
+     * its dap_taskhandle is still non-NULL here. If we left should_exit=true
+     * the old task would self-delete the moment it next runs and we would
+     * have skipped recreating it; was_configured=1 + handle going to NULL
+     * later wedges the probe forever. Resetting unconditionally makes the
+     * flag sticky=false for every probe; an old task that hasn't yet seen
+     * the old true value will simply observe false and keep running normally.
+     * tud_unmount_cb has already been run (was_configured was cleared) so
+     * there is no live "intent to exit" we are clobbering here. */
     for(int i=0;i<MAX_DAP_PROBES;i++)
     {
       DAPEndpointState* state = getEndpointStateByIndex(i);
+      state->should_exit = false;
       if(state->dap_taskhandle == NULL)
       {
-        state->should_exit = false;
         xTaskCreate(dap_thread, "DAP.x", configMINIMAL_STACK_SIZE, state, DAP_TASK_PRIO, &state->dap_taskhandle);
       }
     }

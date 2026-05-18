@@ -347,7 +347,12 @@ void cdc_uart_line_coding_cb(struct CDCUartInstance_t* uart, uint8_t itf, cdc_li
    */
   uint32_t micros = (1000 * 1000 * 16 * 10) / MAX(line_coding->bit_rate, 1);
   /* Modifying state, so park the thread before changing it. */
-  if (tud_cdc_n_connected(uart->itf))
+  /* Fix #16c: guard with non-NULL handle. tud_unmount_cb in main.c clears
+   * uart_taskHandle to NULL after vTaskDelete. tinyUSB CDC line callbacks
+   * dispatch from tud_task() running on usb_thread; calling
+   * vTaskSuspend(NULL) would suspend the CALLING task (usb_thread) and
+   * wedge the entire USB stack. */
+  if (tud_cdc_n_connected(uart->itf) && uart->uart_taskHandle != NULL)
     vTaskSuspend(uart->uart_taskHandle);
   uart->interval = MAX(1, micros / ((1000 * 1000) / configTICK_RATE_HZ));
   probe_info("New baud rate %ld micros %ld interval %lu\n",
@@ -403,7 +408,9 @@ void cdc_uart_line_coding_cb(struct CDCUartInstance_t* uart, uint8_t itf, cdc_li
   uart_set_format(uart->uart, data_bits, stop_bits, parity);
   /* Windows likes to arbitrarily set/get line coding after dtr/rts changes, so
    * don't resume if we shouldn't */
-  if(tud_cdc_n_connected(uart->itf))
+  /* Fix #16c: guard with non-NULL handle (see matching note on the suspend
+   * above). */
+  if(tud_cdc_n_connected(uart->itf) && uart->uart_taskHandle != NULL)
     vTaskResume(uart->uart_taskHandle);
 }
 
@@ -419,6 +426,12 @@ void cdc_uart_line_state_cb(struct CDCUartInstance_t* uart, uint8_t itf, bool dt
 
   /* CDC drivers use linestate as a bodge to activate/deactivate the interface.
    * Resume our UART polling on activate, stop on deactivate */
+  /* Fix #16c: guard with non-NULL handle. Same hazard as line_coding_cb --
+   * after tud_unmount_cb clears uart_taskHandle to NULL, the next CDC
+   * line-state callback would otherwise vTaskSuspend(NULL) and freeze
+   * the usb_thread that the tinyUSB stack runs on. */
+  if (uart->uart_taskHandle == NULL)
+    return;
   if (!dtr) {
     vTaskSuspend(uart->uart_taskHandle);
 #ifdef PROBE_UART_RX_LED

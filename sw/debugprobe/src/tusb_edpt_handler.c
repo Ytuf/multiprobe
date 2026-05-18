@@ -6,6 +6,12 @@
 
 #include "tusb_edpt_handler.h"
 #include "DAP.h"
+/* Fix #16f: probe_deinit() puts the SWD pads HiZ. Needed on cooperative
+ * exit (e.g. USB cable yank -> tud_unmount_cb -> should_exit) so we match
+ * Fix #2's invariant ("pads are HiZ whenever this probe is not active");
+ * without this, DAP_Disconnect is the only path that drops pads, and a
+ * cable yank skips that. */
+#include "probe.h"
 
 #define WR_IDX(x) (x.wptr % DAP_PACKET_COUNT)
 #define RD_IDX(x) (x.rptr % DAP_PACKET_COUNT)
@@ -261,6 +267,12 @@ void dap_thread(void *ptr)
 		 * already been released by us. */
 		if (state->should_exit)
 		{
+			/* Fix #16f: drop the SWD pads to HiZ before self-deleting. On
+			 * a USB cable yank the host never sends DAP_Disconnect, so this
+			 * cooperative-exit path is the only place that can put the pads
+			 * back to a safe state for this probe. probe_deinit() unloads
+			 * the PIO program and disables the state machine. */
+			probe_deinit(state->probeId);
 			state->dap_taskhandle = NULL;
 			vTaskDelete(NULL);
 			/* unreachable */
