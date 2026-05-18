@@ -715,8 +715,9 @@ static uint32_t DAP_SWD_Transfer(uint32_t probeId, const uint8_t *request, uint8
 
   for (; request_count != 0U; request_count--) {
     request_value = *request++;
-    // Worst-case 16B/iter: post_read drain (4B + 4B timestamp) + new xfer (4B + 4B timestamp).
-    if ((response + 16U) > response_limit) {
+    // Minimum headroom: 4 bytes for this iter's data write. Per-write sites
+    // below add their own checks for timestamp / post_read drain extras.
+    if ((response + 4U) > response_limit) {
       break;
     }
     if ((request_value & DAP_TRANSFER_RnW) != 0U) {
@@ -1002,8 +1003,8 @@ static uint32_t DAP_JTAG_Transfer(uint32_t probeId, const uint8_t *request, uint
 
   for (; request_count != 0U; request_count--) {
     request_value = *request++;
-    // Worst-case 16B/iter: post_read drain + new xfer, both TS-tagged.
-    if ((response + 16U) > response_limit) {
+    // Minimum headroom; per-write sites below check their own extras.
+    if ((response + 4U) > response_limit) {
       break;
     }
     request_ir = (request_value & DAP_TRANSFER_APnDP) ? JTAG_APACC : JTAG_DPACC;
