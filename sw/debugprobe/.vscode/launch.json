@@ -1,8 +1,31 @@
 {
+    // Debug the chips connected to the FreeWili multiprobe via SWD.
+    // The multiprobe firmware exposes 4 CMSIS-DAP-v2 vendor interfaces;
+    // pick which slot to use with `cmsis-dap usb interface <N>`.
+    //
+    //   probe 0 -> DISPLAY (RP2350B)
+    //   probe 1 -> MAIN    (RP2350B)
+    //   probe 2 -> WIO-E5  (STM32WLE5JC)
+    //   probe 3 -> unused
+    //
+    // The DISPLAY/MAIN configs use the Raspberry Pi Pico VS Code extension's
+    // ${command:raspberry-pi-pico.*} placeholders to resolve the ELF, GDB,
+    // chip, and openocd target dynamically -- so this launch.json is most
+    // useful when copied into the workspace of the target firmware project
+    // you're actually debugging (FreeWiliMain, FreeWiliDisplay, etc).
+    //
+    // `monitor reset init` (vs `reset halt`) is intentional and required:
+    // it runs openocd's init scripts on every target in the SMP set so that
+    // each core's FPB state is properly examined. Without it, hardware
+    // breakpoints fail to insert with `Remote failure reply: 0E`.
+    //
+    // Windows: to run more than one openocd at a time, replace the WinUSB
+    // driver on each CMSIS-DAP interface with libusbK using Zadig (see the
+    // multiprobe README "Windows compatibility").
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "Pico Debug (Cortex-Debug)",
+            "name": "Debug DISPLAY (RP2350B, probe 0)",
             "cwd": "${userHome}/.pico-sdk/openocd/0.12.0+dev/scripts",
             "executable": "${command:raspberry-pi-pico.launchTargetPath}",
             "request": "launch",
@@ -15,7 +38,7 @@
                 "interface/cmsis-dap.cfg",
                 "target/${command:raspberry-pi-pico.getTarget}.cfg"
             ],
-            "svdFile": "${userHome}/.pico-sdk/sdk/2.2.0/src/${command:raspberry-pi-pico.getChip}/hardware_regs/${command:raspberry-pi-pico.getChipUppercase}.svd",
+            "svdFile": "${userHome}/.pico-sdk/sdk/2.1.1/src/${command:raspberry-pi-pico.getChip}/hardware_regs/${command:raspberry-pi-pico.getChipUppercase}.svd",
             "runToEntryPoint": "main",
             // Fix for no_flash binaries, where monitor reset halt doesn't do what is expected
             // Also works fine for flash binaries
@@ -24,27 +47,122 @@
                 "load \"${command:raspberry-pi-pico.launchTargetPath}\""
             ],
             "openOCDLaunchCommands": [
-                "adapter speed 5000"
+                "adapter speed 5000",
+                "cmsis-dap usb interface 0"
             ]
         },
         {
-            "name": "Pico Debug (Cortex-Debug with external OpenOCD)",
-            "cwd": "${workspaceRoot}",
+            "name": "Debug MAIN (RP2350B, probe 1)",
+            "cwd": "${userHome}/.pico-sdk/openocd/0.12.0+dev/scripts",
             "executable": "${command:raspberry-pi-pico.launchTargetPath}",
             "request": "launch",
             "type": "cortex-debug",
-            "servertype": "external",
-            "gdbTarget": "localhost:3333",
+            "servertype": "openocd",
+            "serverpath": "${userHome}/.pico-sdk/openocd/0.12.0+dev/openocd.exe",
             "gdbPath": "${command:raspberry-pi-pico.getGDBPath}",
             "device": "${command:raspberry-pi-pico.getChipUppercase}",
-            "svdFile": "${userHome}/.pico-sdk/sdk/2.2.0/src/${command:raspberry-pi-pico.getChip}/hardware_regs/${command:raspberry-pi-pico.getChipUppercase}.svd",
+            "configFiles": [
+                "interface/cmsis-dap.cfg",
+                "target/${command:raspberry-pi-pico.getTarget}.cfg"
+            ],
+            "svdFile": "${userHome}/.pico-sdk/sdk/2.1.1/src/${command:raspberry-pi-pico.getChip}/hardware_regs/${command:raspberry-pi-pico.getChipUppercase}.svd",
             "runToEntryPoint": "main",
-            // Fix for no_flash binaries, where monitor reset halt doesn't do what is expected
-            // Also works fine for flash binaries
             "overrideLaunchCommands": [
                 "monitor reset init",
                 "load \"${command:raspberry-pi-pico.launchTargetPath}\""
+            ],
+            "openOCDLaunchCommands": [
+                "adapter speed 5000",
+                "cmsis-dap usb interface 1"
             ]
         },
+        {
+            // STM32 target -- Pico extension's getTarget/getChip placeholders
+            // do not apply, so target/stm32wlx.cfg is hardcoded. Replace
+            // "executable" with the path to your STM32WLE5 firmware ELF.
+            "name": "Debug WIO-E5 (STM32WLE5, probe 2)",
+            "cwd": "${userHome}/.pico-sdk/openocd/0.12.0+dev/scripts",
+            "executable": "${workspaceFolder}/REPLACE-WITH-WIO-TARGET.elf",
+            "request": "launch",
+            "type": "cortex-debug",
+            "servertype": "openocd",
+            "serverpath": "${userHome}/.pico-sdk/openocd/0.12.0+dev/openocd.exe",
+            "gdbPath": "${command:raspberry-pi-pico.getGDBPath}",
+            "device": "STM32WLE5JC",
+            "configFiles": [
+                "interface/cmsis-dap.cfg",
+                "target/stm32wlx.cfg"
+            ],
+            "runToEntryPoint": "main",
+            "overrideLaunchCommands": [
+                "monitor reset init",
+                "load \"${workspaceFolder}/REPLACE-WITH-WIO-TARGET.elf\""
+            ],
+            "openOCDLaunchCommands": [
+                "adapter speed 5000",
+                "transport select swd",
+                "cmsis-dap usb interface 2"
+            ]
+        },
+        {
+            "name": "Attach DISPLAY (RP2350B, probe 0)",
+            "cwd": "${userHome}/.pico-sdk/openocd/0.12.0+dev/scripts",
+            "executable": "${command:raspberry-pi-pico.launchTargetPath}",
+            "request": "attach",
+            "type": "cortex-debug",
+            "servertype": "openocd",
+            "serverpath": "${userHome}/.pico-sdk/openocd/0.12.0+dev/openocd.exe",
+            "gdbPath": "${command:raspberry-pi-pico.getGDBPath}",
+            "device": "${command:raspberry-pi-pico.getChipUppercase}",
+            "configFiles": [
+                "interface/cmsis-dap.cfg",
+                "target/${command:raspberry-pi-pico.getTarget}.cfg"
+            ],
+            "svdFile": "${userHome}/.pico-sdk/sdk/2.1.1/src/${command:raspberry-pi-pico.getChip}/hardware_regs/${command:raspberry-pi-pico.getChipUppercase}.svd",
+            "openOCDLaunchCommands": [
+                "adapter speed 5000",
+                "cmsis-dap usb interface 0"
+            ]
+        },
+        {
+            "name": "Attach MAIN (RP2350B, probe 1)",
+            "cwd": "${userHome}/.pico-sdk/openocd/0.12.0+dev/scripts",
+            "executable": "${command:raspberry-pi-pico.launchTargetPath}",
+            "request": "attach",
+            "type": "cortex-debug",
+            "servertype": "openocd",
+            "serverpath": "${userHome}/.pico-sdk/openocd/0.12.0+dev/openocd.exe",
+            "gdbPath": "${command:raspberry-pi-pico.getGDBPath}",
+            "device": "${command:raspberry-pi-pico.getChipUppercase}",
+            "configFiles": [
+                "interface/cmsis-dap.cfg",
+                "target/${command:raspberry-pi-pico.getTarget}.cfg"
+            ],
+            "svdFile": "${userHome}/.pico-sdk/sdk/2.1.1/src/${command:raspberry-pi-pico.getChip}/hardware_regs/${command:raspberry-pi-pico.getChipUppercase}.svd",
+            "openOCDLaunchCommands": [
+                "adapter speed 5000",
+                "cmsis-dap usb interface 1"
+            ]
+        },
+        {
+            "name": "Attach WIO-E5 (STM32WLE5, probe 2)",
+            "cwd": "${userHome}/.pico-sdk/openocd/0.12.0+dev/scripts",
+            "executable": "${workspaceFolder}/REPLACE-WITH-WIO-TARGET.elf",
+            "request": "attach",
+            "type": "cortex-debug",
+            "servertype": "openocd",
+            "serverpath": "${userHome}/.pico-sdk/openocd/0.12.0+dev/openocd.exe",
+            "gdbPath": "${command:raspberry-pi-pico.getGDBPath}",
+            "device": "STM32WLE5JC",
+            "configFiles": [
+                "interface/cmsis-dap.cfg",
+                "target/stm32wlx.cfg"
+            ],
+            "openOCDLaunchCommands": [
+                "adapter speed 5000",
+                "transport select swd",
+                "cmsis-dap usb interface 2"
+            ]
+        }
     ]
 }
