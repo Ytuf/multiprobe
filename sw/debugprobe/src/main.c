@@ -220,8 +220,10 @@ void tud_suspend_cb(bool remote_wakeup_en)
   if (was_configured) {
     for(int i=0;i<MAX_UART_DEVICES;i++)
     {
+      /* Suspends under the UART hw lock: suspending a task that happens to hold
+       * it would strand the lock for the whole suspend. */
       if(uartDevices[i].isConfigured && uartDevices[i].uart_taskHandle != NULL)
-  	    vTaskSuspend(uartDevices[i].uart_taskHandle);
+  	    cdc_uart_suspend_thread(&uartDevices[i]);
     }
     for(int i=0;i<MAX_DAP_PROBES;i++)
     {

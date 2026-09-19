@@ -37,76 +37,114 @@
 SemaphoreHandle_t globalMutex;
 extern TaskHandle_t uart_taskHandle;
 
+/* Upper bound on how long any caller waits for the UART hardware lock.
+ * configTICK_RATE_HZ is 20000, so portTICK_PERIOD_MS is (1000 / 20000) == 0 by
+ * integer division: the old "portTICK_PERIOD_MS * 1000" timeout was a zero tick
+ * (non-blocking) try that never waited. pdMS_TO_TICKS is exact at this tick rate
+ * (10 * 20000 / 1000 == 200 ticks) and TickType_t is 32 bit here
+ * (configUSE_16_BIT_TICKS 0), so there is no overflow.
+ * Nothing waits forever: a stranded holder must never be able to block tud_task
+ * and with it USB enumeration. */
+#define HW_UART_LOCK_TIMEOUT_TICKS pdMS_TO_TICKS(10)
 
-static void lock_hw_uart()
+
+/* Every UART register access in this file runs under this lock.
+ * uart_deinit() is uart_reset() in the SDK: it asserts the peripheral reset and
+ * leaves the block in reset until the matching uart_init(). A register access
+ * from any other task inside that window faults the bus -> HardFault -> the
+ * default handler spins, while the USB pull-up stays asserted in hardware, so
+ * the host sees an attached device that answers nothing.
+ * Returns true only if the lock was actually taken; only a successful taker may
+ * call unlock_hw_uart(). A give from a non-owner clears xMutexHolder and
+ * decrements the real owner's uxMutexesHeld, and configASSERT is compiled out in
+ * Release (-DNDEBUG), so that corruption would be silent. */
+static bool lock_hw_uart(TickType_t timeoutTicks)
 {
-  xSemaphoreTake( globalMutex, portMAX_DELAY );
+  if( globalMutex == NULL )
+    return false;
+
+  return xSemaphoreTake( globalMutex, timeoutTicks ) == pdTRUE;
 }
 
 
-static void unlock_hw_uart()
+static void unlock_hw_uart(void)
 {
   xSemaphoreGive( globalMutex );
 }
 
 
+static bool cdc_uart_hw_live(const struct CDCUartInstance_t* uartInst)
+{
+  return uartInst->isUartInitialised && uartInst->uart != NULL;
+}
+
+
+/* Caller must hold the hw lock and must have checked cdc_uart_hw_live(), i.e.
+ * that the block is bound and out of reset. */
+static void cdc_uart_drain_rx(struct CDCUartInstance_t* uartInst)
+{
+  uint32_t readCnt = 0;
+
+  while(uart_is_readable(uartInst->uart) && readCnt < 32 )
+  {
+    uint8_t c = (uint8_t)uart_get_hw(uartInst->uart)->dr;
+    uartInst->buffer[ uartInst->writingBuffer ] = c;
+    uartInst->writingBuffer = (uartInst->writingBuffer + 1) % CDC_BUFFER_SZ;
+
+    readCnt++;
+  }
+}
+
+
 void cdc_uart_core2( void* ptr)
-{    
+{
     struct CDCUartInstance_t* uartInst0 = &uartDevices[0];
     struct CDCUartInstance_t* uartInst1 = &uartDevices[1];
-
-    uint32_t readCnt;
 
     while (true)
     {
       tight_loop_contents();
-    
-      if( xSemaphoreTake( globalMutex, portTICK_PERIOD_MS * 1000 ) == pdTRUE )
+
+      /* This is the highest priority task in the system and it polls every tick,
+       * so it is the task that preempts into a uart_deinit()/uart_init() window.
+       * It must never touch a UART without holding the lock, and never one that
+       * is not initialised: an unbound instance can still hold a non-NULL uart
+       * pointer (a profile with rxPin/txPin == -1 sets uart->uart and then
+       * returns before uart_init()). */
+      if( lock_hw_uart( HW_UART_LOCK_TIMEOUT_TICKS ) )
       {
-        readCnt = 0;
-        while(uart_is_readable(uartInst0->uart) && readCnt < 32 )
-        {                            
-          uint8_t c = (uint8_t)uart_get_hw(uartInst0->uart)->dr;
-          uartInst0->buffer[ uartInst0->writingBuffer ] = c;
-          uartInst0->writingBuffer = (uartInst0->writingBuffer + 1) % CDC_BUFFER_SZ;         
+        if( cdc_uart_hw_live(uartInst0) )
+          cdc_uart_drain_rx(uartInst0);
 
-          readCnt++;
-        }
+        /* Same hw uart bound twice: already drained above. */
+        if( cdc_uart_hw_live(uartInst1) && uartInst1->uart != uartInst0->uart )
+          cdc_uart_drain_rx(uartInst1);
 
-        if(uartInst1->uart != uartInst0->uart)
-        {
-          readCnt = 0;
-          while(uart_is_readable(uartInst1->uart) && readCnt < 32 )
-          {     
-            uint8_t c = (uint8_t)uart_get_hw(uartInst1->uart)->dr;
-            uartInst1->buffer[ uartInst1->writingBuffer ] = c;
-            uartInst1->writingBuffer = (uartInst1->writingBuffer + 1) % CDC_BUFFER_SZ;                                    
-
-            readCnt++;
-          }
-        }
+        unlock_hw_uart();
       }
 
-      xSemaphoreGive( globalMutex );
-
       TickType_t wake;
-      wake = xTaskGetTickCount();      
-      xTaskDelayUntil(&wake, 1);   
+      wake = xTaskGetTickCount();
+      xTaskDelayUntil(&wake, 1);
     }
 }
 
 
-void cdc_uart_init(struct CDCUartInstance_t* uart, const struct UartProfile_t* profile) 
+/* Returns false only when the hw lock could not be taken, i.e. "try again
+ * later"; the caller must keep the pending profile so the port is not stranded.
+ * A profile with no pins is not an error: there is simply nothing to bind. */
+bool cdc_uart_init(struct CDCUartInstance_t* uart, const struct UartProfile_t* profile)
 {
   if(!profile)
-    return;
+    return true;
 
-  lock_hw_uart();
+  if(!lock_hw_uart(HW_UART_LOCK_TIMEOUT_TICKS))
+    return false;
 
   if(uart->isUartInitialised)
   {
     unlock_hw_uart();
-    return;
+    return true;
   }
 
   switch (profile->hwUartId)
@@ -129,7 +167,7 @@ void cdc_uart_init(struct CDCUartInstance_t* uart, const struct UartProfile_t* p
   if(uart->rxPin == -1 || uart->txPin == -1)
   {
     unlock_hw_uart();
-    return;
+    return true;
   }
   gpio_set_function(uart->rxPin, GPIO_FUNC_UART);
   gpio_set_function(uart->txPin, GPIO_FUNC_UART);
@@ -162,36 +200,46 @@ void cdc_uart_init(struct CDCUartInstance_t* uart, const struct UartProfile_t* p
   uart->isUartInitialised = true;
 
   unlock_hw_uart();
+  return true;
 }
 
 
-void cdc_uart_deinit(struct CDCUartInstance_t* uart)
-{      
-  lock_hw_uart();
+/* Returns false only when the hw lock could not be taken (see cdc_uart_init). */
+bool cdc_uart_deinit(struct CDCUartInstance_t* uart)
+{
+  if(!lock_hw_uart(HW_UART_LOCK_TIMEOUT_TICKS))
+    return false;
 
   if(!uart->isUartInitialised)
   {
     unlock_hw_uart();
-    return;
+    return true;
   }
 
-  if(uart->uart)
-    uart_deinit(uart->uart);
-  
+  /* Publish "no hardware" before the block goes into reset. uart_deinit() leaves
+   * the UART in reset, so anything that still saw a live instance here would
+   * fault the bus on its next register access. Holders of the lock are already
+   * excluded; this also protects the unlocked isUartInitialised checks
+   * (tud_cdc_line_coding_cb / tud_cdc_line_state_cb / cdc_led_update). */
+  uart_inst_t* hwUart = uart->uart;
+  uart->uart = 0;
+  uart->isUartInitialised = false;
+
+  if(hwUart)
+    uart_deinit(hwUart);
+
   if(uart->rxPin != -1)
     gpio_set_function(uart->rxPin, GPIO_FUNC_NULL);
   if(uart->txPin != -1)
-    gpio_set_function(uart->txPin, GPIO_FUNC_NULL);     
+    gpio_set_function(uart->txPin, GPIO_FUNC_NULL);
 
-  uart->currentProfile = 0;  
+  uart->currentProfile = 0;
   uart->baud = -1;
   uart->rxPin = -1;
-  uart->txPin = -1;    
-  uart->uart = 0;
-      
-  uart->isUartInitialised = false;
+  uart->txPin = -1;
 
   unlock_hw_uart();
+  return true;
 }
 
 
@@ -209,7 +257,11 @@ void cdc_activate_profile( int uartId, int profileId )
 void cdc_handle_profile_switch(struct CDCUartInstance_t* uart)
 {
   if(uart->nextProfile)
-  {              
+  {
+    /* Snapshot: cdc_activate_profile() can retarget nextProfile from another
+     * context while the switch is in progress. */
+    const struct UartProfile_t* nextProfile = uart->nextProfile;
+
     // Release matching hw
     for(int i=0;i<MAX_UART_DEVICES;i++)
     {
@@ -220,22 +272,27 @@ void cdc_handle_profile_switch(struct CDCUartInstance_t* uart)
         if(uartDevices[i].currentProfile)
         {
           // Same hw
-          if(uartDevices[i].currentProfile->hwUartId == uart->nextProfile->hwUartId)
+          if(uartDevices[i].currentProfile->hwUartId == nextProfile->hwUartId)
           {
             // Release it
-            cdc_uart_deinit(&uartDevices[i]);
+            /* Keep nextProfile pending and retry on the next pass if the hw lock
+             * is busy - dropping the request would strand the port. */
+            if(!cdc_uart_deinit(&uartDevices[i]))
+              return;
           }
-        }        
+        }
       }
     }
 
-    
+
 
     // de-init current
-    cdc_uart_deinit(uart);
+    if(!cdc_uart_deinit(uart))
+      return;
 
     // bind uart to profile
-    cdc_uart_init(uart, uart->nextProfile);
+    if(!cdc_uart_init(uart, nextProfile))
+      return;
   }
 
   uart->nextProfile = 0;
@@ -283,31 +340,50 @@ bool cdc_uart_task(struct CDCUartInstance_t* uart)
         /* Batch up to half a FIFO of data - don't clog up on RX */
         watermark = MIN(watermark, 16);
         tx_len = tud_cdc_n_read(uart->itf, uart->tx_buf, watermark);
-   
-        uart_write_blocking(uart->uart, uart->tx_buf, tx_len);
+
+        /* The block can be in reset (uart_deinit()/uart_init() in
+         * cdc_uart_line_coding_cb) while this task runs, so take the lock and
+         * re-check under it. */
+        if (tx_len && lock_hw_uart(HW_UART_LOCK_TIMEOUT_TICKS)) {
+          if (cdc_uart_hw_live(uart))
+            uart_write_blocking(uart->uart, uart->tx_buf, tx_len);
+          unlock_hw_uart();
+        }
 
         uart->lastActivityTimeTx = time_us_32();
-      } 
+      }
 
       /* Pending break handling */
-      if (uart->timed_break) 
+      if (uart->timed_break)
       {
         if (((int)uart->break_expiry - (int)xTaskGetTickCount()) < 0) {
-          uart->timed_break = false;          
-          uart_set_break(uart->uart, false);
-        } 
-        else 
+          if (lock_hw_uart(HW_UART_LOCK_TIMEOUT_TICKS)) {
+            if (cdc_uart_hw_live(uart))
+              uart_set_break(uart->uart, false);
+            unlock_hw_uart();
+            uart->timed_break = false;
+          }
+          else
+          {
+            /* Could not clear the break yet - stay hot and retry. */
+            keep_alive = true;
+          }
+        }
+        else
         {
           keep_alive = true;
         }
       }
-    } 
-    else if (uart->was_connected) 
+    }
+    else if (uart->was_connected)
     {
       tud_cdc_n_write_clear(uart->itf);
 
-      if(uart->uart)
-        uart_set_break(uart->uart, false);
+      if (lock_hw_uart(HW_UART_LOCK_TIMEOUT_TICKS)) {
+        if (cdc_uart_hw_live(uart))
+          uart_set_break(uart->uart, false);
+        unlock_hw_uart();
+      }
 
       uart->timed_break = false;
       uart->was_connected = 0;
@@ -346,17 +422,12 @@ void cdc_uart_line_coding_cb(struct CDCUartInstance_t* uart, uint8_t itf, cdc_li
    * fill up half a FIFO. Millis is too coarse for integer divide.
    */
   uint32_t micros = (1000 * 1000 * 16 * 10) / MAX(line_coding->bit_rate, 1);
-  /* Modifying state, so park the thread before changing it. */
-  /* Handle may be NULL post-unmount; vTaskSuspend(NULL) would suspend usb_thread. */
-  if (tud_cdc_n_connected(uart->itf) && uart->uart_taskHandle != NULL)
-    vTaskSuspend(uart->uart_taskHandle);
   uart->interval = MAX(1, micros / ((1000 * 1000) / configTICK_RATE_HZ));
   probe_info("New baud rate %ld micros %ld interval %lu\n",
                   line_coding->bit_rate, micros, uart->interval);
-  uart_deinit(uart->uart);
+
   tud_cdc_n_write_clear(uart->itf);
   tud_cdc_n_read_flush(uart->itf);
-  uart_init(uart->uart, line_coding->bit_rate);
 
   switch (line_coding->parity) {
   case CDC_LINE_CODING_PARITY_ODD:
@@ -401,16 +472,56 @@ void cdc_uart_line_coding_cb(struct CDCUartInstance_t* uart, uint8_t itf, cdc_li
   break;
   }
 
-  uart_set_format(uart->uart, data_bits, stop_bits, parity);
-  /* Windows likes to arbitrarily set/get line coding after dtr/rts changes, so
-   * don't resume if we shouldn't */
-  if(tud_cdc_n_connected(uart->itf) && uart->uart_taskHandle != NULL)
-    vTaskResume(uart->uart_taskHandle);
+  /* This runs in the tud_task context. The old code parked uart_taskHandle
+   * here, which is neither the task that polls these registers every tick
+   * (cdc_uart_core2, the highest priority task in the system) nor a safe thing
+   * to do: suspending an arbitrary task can strand a mutex holder, and the
+   * suspend/resume pair was conditional on tud_cdc_n_connected(), which the host
+   * can change in between, leaving the task suspended for good.
+   * Hold the hw lock instead - it is the same lock every register access in this
+   * file takes - so nothing can touch the block while it is in reset between
+   * uart_deinit() and uart_init().
+   * Windows opens/reopens the port and re-sends line coding constantly, so this
+   * path must never be able to wedge tud_task: the wait is bounded and a failed
+   * take simply skips the reconfiguration (the host will set line coding again).
+   */
+  if (lock_hw_uart(HW_UART_LOCK_TIMEOUT_TICKS))
+  {
+    /* Re-check under the lock: a profile switch can have unbound this instance
+     * since the unlocked isUartInitialised test in tud_cdc_line_coding_cb.
+     * uart_deinit(NULL) would resolve to uart0 and reset an unrelated block. */
+    if (cdc_uart_hw_live(uart))
+    {
+      uart_deinit(uart->uart);
+      uart_init(uart->uart, line_coding->bit_rate);
+      uart_set_format(uart->uart, data_bits, stop_bits, parity);
+    }
+
+    unlock_hw_uart();
+  }
+}
+
+
+/* Suspending a task that holds the hw lock strands the lock: the holder can no
+ * longer run to release it, so every other UART user would block until it is
+ * resumed. Hold the lock across the suspend - the target cannot then be inside a
+ * locked region. If the lock cannot be taken in time we still suspend (that is
+ * the caller's contract), and every waiter is bounded, so the worst case is a
+ * degraded UART, never a wedged tud_task. */
+void cdc_uart_suspend_thread(struct CDCUartInstance_t* uart)
+{
+  if (uart->uart_taskHandle == NULL)  // can be cleared by tud_unmount_cb
+    return;
+
+  bool locked = lock_hw_uart(HW_UART_LOCK_TIMEOUT_TICKS);
+  vTaskSuspend(uart->uart_taskHandle);
+  if (locked)
+    unlock_hw_uart();
 }
 
 
 void cdc_uart_line_state_cb(struct CDCUartInstance_t* uart, uint8_t itf, bool dtr, bool rts)
-{  
+{
 #ifdef PROBE_UART_RTS
   gpio_put(uart->rtsPin, !rts);
 #endif
@@ -423,7 +534,7 @@ void cdc_uart_line_state_cb(struct CDCUartInstance_t* uart, uint8_t itf, bool dt
   if (uart->uart_taskHandle == NULL)  // can be cleared by tud_unmount_cb
     return;
   if (!dtr) {
-    vTaskSuspend(uart->uart_taskHandle);
+    cdc_uart_suspend_thread(uart);
 #ifdef PROBE_UART_RX_LED
     gpio_put(PROBE_UART_RX_LED, 0);
     rx_led_debounce = 0;
