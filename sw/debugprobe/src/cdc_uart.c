@@ -333,20 +333,42 @@ bool cdc_uart_task(struct CDCUartInstance_t* uart)
         }
 
       /* Reading from a firehose and writing to a FIFO. */
-      size_t watermark = MIN(tud_cdc_n_available(uart->itf), sizeof(uart->tx_buf));
-      if (watermark > 0) {
-        size_t tx_len;
+      /* Whatever did not fit into the TX FIFO last pass goes out first, so the
+       * stream stays in order and nothing is dropped. */
+      if (uart->tx_buf_pos >= uart->tx_buf_len) {
+        uart->tx_buf_pos = 0;
+        uart->tx_buf_len = 0;
 
-        /* Batch up to half a FIFO of data - don't clog up on RX */
-        watermark = MIN(watermark, 16);
-        tx_len = tud_cdc_n_read(uart->itf, uart->tx_buf, watermark);
+        size_t watermark = MIN(tud_cdc_n_available(uart->itf), sizeof(uart->tx_buf));
+        if (watermark > 0) {
+          /* Batch up to half a FIFO of data - don't clog up on RX */
+          watermark = MIN(watermark, 16);
+          uart->tx_buf_len = (uint8_t) tud_cdc_n_read(uart->itf, uart->tx_buf, watermark);
+        }
+      }
 
+      if (uart->tx_buf_pos < uart->tx_buf_len) {
         /* The block can be in reset (uart_deinit()/uart_init() in
          * cdc_uart_line_coding_cb) while this task runs, so take the lock and
-         * re-check under it. */
-        if (tx_len && lock_hw_uart(HW_UART_LOCK_TIMEOUT_TICKS)) {
-          if (cdc_uart_hw_live(uart))
-            uart_write_blocking(uart->uart, uart->tx_buf, tx_len);
+         * re-check under it.
+         * Never block on the wire while holding that lock: uart_write_blocking()
+         * spins until the 32 byte TX FIFO has room, i.e. up to ~16 character
+         * times per pass under sustained host -> target streaming (1.4 ms at
+         * 115200, 16.6 ms at 9600, 133 ms at 1200), which blows straight past
+         * the 10 ms every other lock user waits - including the tick-rate RX
+         * drain in cdc_uart_core2, whose skipped passes overrun the 32 byte RX
+         * FIFO. Push only what the FIFO can take right now; the rest goes out on
+         * the next pass, which is scheduled one FIFO-fill time from now. */
+        if (lock_hw_uart(HW_UART_LOCK_TIMEOUT_TICKS)) {
+          if (cdc_uart_hw_live(uart)) {
+            while (uart->tx_buf_pos < uart->tx_buf_len && uart_is_writable(uart->uart))
+              uart_get_hw(uart->uart)->dr = uart->tx_buf[uart->tx_buf_pos++];
+          }
+          else {
+            /* No hardware bound - drop, as the old uart_write_blocking() path
+             * did, rather than hold the bytes until some later binding. */
+            uart->tx_buf_pos = uart->tx_buf_len;
+          }
           unlock_hw_uart();
         }
 
@@ -388,6 +410,10 @@ bool cdc_uart_task(struct CDCUartInstance_t* uart)
       uart->timed_break = false;
       uart->was_connected = 0;
       uart->cdc_tx_oe = 0;
+      /* Drop anything still queued for the wire with the session it came from,
+       * rather than emit it into the next one. */
+      uart->tx_buf_pos = 0;
+      uart->tx_buf_len = 0;
     }
 
     return keep_alive;

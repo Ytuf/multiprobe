@@ -77,7 +77,14 @@ typedef struct CDCUartInstance_t
     TickType_t interval;
     volatile TickType_t break_expiry;
     volatile bool timed_break;
+
     uint8_t tx_buf[32];    
+    /* Bytes read out of the CDC FIFO but not yet pushed into the UART TX FIFO.
+     * cdc_uart_task never blocks on the wire while holding the hw lock, so a
+     * full TX FIFO leaves a remainder here for the next pass. */
+    uint8_t tx_buf_len;
+    uint8_t tx_buf_pos;
+
     TaskHandle_t uart_taskHandle;    
     bool was_connected;
     uint cdc_tx_oe;
