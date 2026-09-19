@@ -14,6 +14,18 @@
 #define WR_SLOT_PTR(x) &(x.data[WR_IDX(x)][0])
 #define RD_SLOT_PTR(x) &(x.data[RD_IDX(x)][0])
 
+/* Bounded wait for ring_mutex from the tud_task context (dap_edpt_xfer_cb,
+ * dap_suspend_thread). Nothing running in tud_task may wait on this lock
+ * indefinitely: with INCLUDE_vTaskSuspend == 1 an xSemaphoreTake(portMAX_DELAY)
+ * can only return pdPASS or block forever (xTaskCheckForTimeOut returns pdFALSE
+ * unconditionally for portMAX_DELAY), so one stranded holder kills tud_task, and
+ * with it USB enumeration, until the next power cycle.
+ * The lock is only ever held across a memcpy and one usbd_edpt_xfer(), and a
+ * dap_thread that holds it inherits the priority of the waiting tud_task, so
+ * 2 ms (40 ticks at configTICK_RATE_HZ 20000) is far longer than any legitimate
+ * hold and far shorter than any host timeout. */
+#define DAP_RING_LOCK_TIMEOUT_TICKS pdMS_TO_TICKS(2)
+
 DAPEndpointState ep_states[MAX_DAP_PROBES] = {};
 
 bool buffer_full(buffer_t *buffer)
@@ -46,6 +58,8 @@ bool dap_edpt_deinit(void)
 		memset(state->DAPResponseBuffer, 0, sizeof(state->DAPResponseBuffer));
 		state->USBRequestBuffer.wptr = state->USBRequestBuffer.rptr = 0;
 		state->USBResponseBuffer.wptr = state->USBResponseBuffer.rptr = 0;
+		// Indices are gone, so a deferred update from the old session must not run.
+		state->in_cb_deferred = state->out_cb_deferred = false;
 	}
 
 	return true;
@@ -119,6 +133,11 @@ uint16_t dap_edpt_open(uint8_t rhport, tusb_desc_interface_t const *itf_desc, ui
 	state->USBRequestBuffer.wasFull = false;
 	state->USBRequestBuffer.wasEmpty = true;
 
+	// A deferred update from the previous session would bump the indices we
+	// just reset, so drop it with the session it belongs to.
+	state->in_cb_deferred = false;
+	state->out_cb_deferred = false;
+
 	uint16_t const drv_len = sizeof(tusb_desc_interface_t) + (itf_desc->bNumEndpoints * sizeof(tusb_desc_endpoint_t));
 	TU_VERIFY(max_len >= drv_len, 0);
 	state->itf_num = itf_desc->bInterfaceNumber;
@@ -144,6 +163,15 @@ uint16_t dap_edpt_open(uint8_t rhport, tusb_desc_interface_t const *itf_desc, ui
 	// The IN endpoint doesn't need a transfer to initialise it, as this will be done by the main loop of dap_thread
 	usbd_edpt_open(rhport, edpt_desc);
 
+	/* We are being configured, so the bus is not suspended. If the host reset us
+	 * instead of resuming, tud_resume_cb never ran, and tud_mount_cb will not
+	 * resume the thread either (was_configured survives a reset - _usbd_reset()
+	 * does not call tud_umount_cb), so a thread suspended by tud_suspend_cb
+	 * would stay suspended and this probe would stay dead until a power cycle.
+	 * vTaskResume() on a task that is not suspended is a no-op. */
+	if (state->dap_taskhandle != NULL)
+		vTaskResume(state->dap_taskhandle);
+
 	return drv_len;
 
 }
@@ -168,10 +196,25 @@ bool dap_edpt_xfer_cb(uint8_t __unused rhport, uint8_t ep_addr, xfer_result_t re
 	{
 		if(xferred_bytes >= 0u && xferred_bytes <= DAP_PACKET_SIZE)
 		{
-			/* Give only if the take succeeded - a give from a non-owner silently
-			 * corrupts the mutex (configASSERT is compiled out in Release). */
-			bool locked = (state->ring_mutex != NULL) &&
-			              (xSemaphoreTake(state->ring_mutex, portMAX_DELAY) == pdTRUE);
+			/* Bounded take (see DAP_RING_LOCK_TIMEOUT_TICKS); give only if it
+			 * succeeded, as a give from a non-owner silently corrupts the mutex
+			 * (configASSERT is compiled out in Release).
+			 * If the lock is busy, hand the ring update to dap_thread rather
+			 * than touch the ring unlocked: the IN transfer that just completed
+			 * is the only one outstanding on this endpoint and no new one is
+			 * queued until that update runs, so at most one can be pending. */
+			bool locked = false;
+			if (state->ring_mutex != NULL)
+			{
+				locked = (xSemaphoreTake(state->ring_mutex, DAP_RING_LOCK_TIMEOUT_TICKS) == pdTRUE);
+				if (!locked)
+				{
+					state->in_cb_deferred = true;
+					if (state->dap_taskhandle != NULL)
+						xTaskNotifyGive(state->dap_taskhandle);
+					return true;
+				}
+			}
 
 			state->USBResponseBuffer.rptr++;
 
@@ -201,8 +244,23 @@ bool dap_edpt_xfer_cb(uint8_t __unused rhport, uint8_t ep_addr, xfer_result_t re
 
 		if(xferred_bytes >= 0u && xferred_bytes <= DAP_PACKET_SIZE)
 		{
-			bool locked = (state->ring_mutex != NULL) &&
-			              (xSemaphoreTake(state->ring_mutex, portMAX_DELAY) == pdTRUE);
+			/* Same bounded take as the IN case. The received packet is already
+			 * in the write slot; only the wptr bump that publishes it and the
+			 * re-arming transfer are deferred, so nothing is lost or reordered
+			 * and no further OUT completion can arrive until dap_thread has run
+			 * the deferred update. */
+			bool locked = false;
+			if (state->ring_mutex != NULL)
+			{
+				locked = (xSemaphoreTake(state->ring_mutex, DAP_RING_LOCK_TIMEOUT_TICKS) == pdTRUE);
+				if (!locked)
+				{
+					state->out_cb_deferred = true;
+					if (state->dap_taskhandle != NULL)
+						xTaskNotifyGive(state->dap_taskhandle);
+					return true;
+				}
+			}
 
 			// Only queue the next buffer in the out callback if the buffer is not full
 			// If full, we set the wasFull flag, which will be checked by dap thread
@@ -229,6 +287,101 @@ bool dap_edpt_xfer_cb(uint8_t __unused rhport, uint8_t ep_addr, xfer_result_t re
 	else return false;
 }
 
+/* Ring updates that dap_edpt_xfer_cb could not do itself because the lock was
+ * busy. Runs the exact same body, in dap_thread, under the same lock - only
+ * later - so the ring stays consistent and no packet is dropped. */
+static void dap_service_deferred_cb(DAPEndpointState* state)
+{
+	if (!state->in_cb_deferred && !state->out_cb_deferred)
+		return;
+
+	bool locked = false;
+	if (state->ring_mutex != NULL)
+	{
+		/* Bounded here too: if it fails the flags stay set and the notify wait
+		 * below stays short, so this is retried instead of being lost. */
+		locked = (xSemaphoreTake(state->ring_mutex, DAP_RING_LOCK_TIMEOUT_TICKS) == pdTRUE);
+		if (!locked)
+			return;
+	}
+
+	if (state->out_cb_deferred)
+	{
+		state->out_cb_deferred = false;
+
+		if(!buffer_full(&state->USBRequestBuffer))
+		{
+			state->USBRequestBuffer.wptr++;
+			usbd_edpt_xfer(state->_rhport, state->_out_ep_addr, WR_SLOT_PTR(state->USBRequestBuffer), DAP_PACKET_SIZE);
+			state->USBRequestBuffer.wasFull = false;
+		}
+		else {
+			state->USBRequestBuffer.wasFull = true;
+		}
+	}
+
+	if (state->in_cb_deferred)
+	{
+		state->in_cb_deferred = false;
+
+		state->USBResponseBuffer.rptr++;
+
+		if(!state->USBResponseBuffer.wasEmpty)
+		{
+			uint16_t slot_len = state->resp_lens[RD_IDX(state->USBResponseBuffer)];
+			usbd_edpt_xfer(state->_rhport, state->_in_ep_addr, RD_SLOT_PTR(state->USBResponseBuffer), slot_len);
+			state->USBResponseBuffer.wasEmpty = (state->USBResponseBuffer.rptr + 1) == state->USBResponseBuffer.wptr;
+		}
+	}
+
+	if (locked)
+		xSemaphoreGive(state->ring_mutex);
+}
+
+
+/* Wait for a callback to wake us - but never indefinitely while a callback is
+ * still waiting on us to finish its ring update, as nothing else would wake us:
+ * a deferred OUT update owns the wptr bump the consumer loop waits for. */
+static void dap_wait_for_cb(DAPEndpointState* state)
+{
+	dap_service_deferred_cb(state);
+
+	ulTaskNotifyTake(pdTRUE, (state->in_cb_deferred || state->out_cb_deferred)
+	                         ? DAP_RING_LOCK_TIMEOUT_TICKS : portMAX_DELAY);
+}
+
+
+/* tud_suspend_cb used to call vTaskSuspend() on dap_thread unguarded. Suspending
+ * it inside a locked region strands ring_mutex, and if the host resets instead
+ * of resuming (tud_resume_cb never runs; _usbd_reset() does not call
+ * tud_umount_cb, so was_configured stays 1 and tud_mount_cb will not resume it
+ * either) the lock is never released - which used to wedge tud_task in
+ * dap_edpt_xfer_cb for the rest of the power cycle. Take the lock first so the
+ * target cannot be inside a locked region.
+ * Unlike cdc_uart_suspend_thread, a failed take does NOT suspend anyway: this
+ * suspend is only a power saving, and dap_thread is parked on a notification for
+ * the whole bus suspend regardless (no callbacks arrive), so skipping it costs
+ * nothing, while suspending a possible lock holder costs exactly the failure
+ * above. */
+void dap_suspend_thread(DAPEndpointState* state)
+{
+	if (state->dap_taskhandle == NULL)
+		return;
+
+	if (state->ring_mutex == NULL)  // no lock exists, so none can be stranded
+	{
+		vTaskSuspend(state->dap_taskhandle);
+		return;
+	}
+
+	if (xSemaphoreTake(state->ring_mutex, DAP_RING_LOCK_TIMEOUT_TICKS) != pdTRUE)
+		return;
+
+	vTaskSuspend(state->dap_taskhandle);
+	xSemaphoreGive(state->ring_mutex);
+}
+
+
 void dap_thread(void *ptr)
 {
 	struct DAPEndpointState* state = (struct DAPEndpointState*)ptr;
@@ -242,6 +395,9 @@ void dap_thread(void *ptr)
 			vTaskDelete(NULL);
 			/* unreachable */
 		}
+
+		// Publish anything a callback handed over before consuming the ring.
+		dap_service_deferred_cb(state);
 		while(state->USBRequestBuffer.rptr != state->USBRequestBuffer.wptr)
 		{
 			/*
@@ -258,7 +414,7 @@ void dap_thread(void *ptr)
 				while (n == state->USBRequestBuffer.wptr) {
 					/* Need yield in a loop here, as IN callbacks will also wake the thread */
 					probe_info("DAP wait\n");
-					ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+					dap_wait_for_cb(state);
 				}
 			}
 			// Read a single packet from the USB buffer into the DAP Request buffer
@@ -271,6 +427,11 @@ void dap_thread(void *ptr)
 			// If the buffer was full in the out callback, we need to queue up another buffer for the endpoint to consume, now that we know there is space in the buffer.
 			if(state->USBRequestBuffer.wasFull)
 			{
+				/* dap_thread is not tud_task, so portMAX_DELAY is acceptable
+				 * here: the only other taker is dap_edpt_xfer_cb, whose hold is
+				 * a memcpy plus one usbd_edpt_xfer(). With INCLUDE_vTaskSuspend
+				 * == 1 such a take cannot fail, so the flag only covers a NULL
+				 * mutex (creation failed at boot under heap_1). */
 				bool locked = (state->ring_mutex != NULL) &&
 				              (xSemaphoreTake(state->ring_mutex, portMAX_DELAY) == pdTRUE);
 				state->USBRequestBuffer.wptr++;
@@ -286,6 +447,8 @@ void dap_thread(void *ptr)
 					dap_cmd_string[DAPResponseBuffer[0]]);*/
 
 
+			/* portMAX_DELAY for the same reason as above; the flag only covers a
+			 * NULL mutex. */
 			bool respLocked = (state->ring_mutex != NULL) &&
 			                  (xSemaphoreTake(state->ring_mutex, portMAX_DELAY) == pdTRUE);
 
@@ -311,7 +474,7 @@ void dap_thread(void *ptr)
 		}
 
 		// Suspend DAP thread until it is awoken by a USB thread callback
-		ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+		dap_wait_for_cb(state);
 
 	} while (1);
 

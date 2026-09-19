@@ -54,12 +54,23 @@ typedef struct DAPEndpointState
 	/* Serializes ring updates between dap_thread and xfer_cb; usbd_edpt_xfer
 	 * cannot be called with the scheduler suspended (it takes osal mutexes). */
 	SemaphoreHandle_t ring_mutex;
+
+	/* Ring update handed to dap_thread by dap_edpt_xfer_cb when it could not
+	 * take ring_mutex in time (it runs in tud_task and must not wait long).
+	 * At most one can be outstanding per direction: no new transfer is queued on
+	 * that endpoint until the deferred update has run. */
+	volatile bool in_cb_deferred;
+	volatile bool out_cb_deferred;
 } DAPEndpointState;
 
 extern DAPEndpointState ep_states[MAX_DAP_PROBES];
 
 /* Main DAP loop */
 void dap_thread(void *ptr);
+
+/* Suspends state->dap_taskhandle without stranding ring_mutex; does nothing if
+ * the lock cannot be taken in time (see the comment on the definition). */
+void dap_suspend_thread(DAPEndpointState* state);
 
 /* Endpoint Handling */
 void dap_edpt_init(void);

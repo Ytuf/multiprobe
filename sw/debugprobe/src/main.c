@@ -227,9 +227,10 @@ void tud_suspend_cb(bool remote_wakeup_en)
     }
     for(int i=0;i<MAX_DAP_PROBES;i++)
     {
-      DAPEndpointState* state = getEndpointStateByIndex(i);
-      if(state->dap_taskhandle != NULL)
-        vTaskSuspend(state->dap_taskhandle);
+      /* Suspends under the DAP ring lock: suspending dap_thread inside a locked
+       * region strands ring_mutex, which used to wedge tud_task in
+       * dap_edpt_xfer_cb for the rest of the power cycle. */
+      dap_suspend_thread(getEndpointStateByIndex(i));
     }
   }
   /* slow down clk_sys for power saving ? */
