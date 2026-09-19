@@ -192,8 +192,13 @@ void probe_init(uint32_t probeId) {
     SemaphoreHandle_t mutex = pio_mutex[pio_get_index(probes[probeId].pio)];
     /* Give only if the take succeeded: a give from a non-owner clears
      * xMutexHolder and corrupts the owner's uxMutexesHeld, silently, because
-     * configASSERT is compiled out in Release. A portMAX_DELAY take does fail if
-     * the task is suspended (tud_suspend_cb) while blocked on the mutex. */
+     * configASSERT is compiled out in Release. With INCLUDE_vTaskSuspend == 1 a
+     * portMAX_DELAY take cannot report failure - xTaskCheckForTimeOut() returns
+     * pdFALSE unconditionally for portMAX_DELAY, so the take either succeeds or
+     * blocks forever, and a vTaskSuspend() on the waiter only parks it until it
+     * is resumed and blocks again - so here the flag only covers a NULL mutex
+     * (creation failed at boot under heap_1). This runs in dap_thread, never in
+     * tud_task, so an unbounded wait cannot stall USB enumeration. */
     bool locked = (mutex != NULL) && (xSemaphoreTake(mutex, portMAX_DELAY) == pdTRUE);
     // initted check inside mutex closes window vs concurrent probe_init/deinit on the same PIO.
     if (!probes[probeId].initted) {

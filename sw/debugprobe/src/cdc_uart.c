@@ -54,7 +54,8 @@ extern TaskHandle_t uart_taskHandle;
  * from any other task inside that window faults the bus -> HardFault -> the
  * default handler spins, while the USB pull-up stays asserted in hardware, so
  * the host sees an attached device that answers nothing.
- * Returns true only if the lock was actually taken; only a successful taker may
+ * Returns true only if the lock was actually taken - every caller passes a
+ * finite timeout, so a take really can fail - and only a successful taker may
  * call unlock_hw_uart(). A give from a non-owner clears xMutexHolder and
  * decrements the real owner's uxMutexesHeld, and configASSERT is compiled out in
  * Release (-DNDEBUG), so that corruption would be silent. */

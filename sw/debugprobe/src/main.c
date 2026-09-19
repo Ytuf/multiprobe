@@ -259,8 +259,12 @@ void tud_unmount_cb(void)
   probe_info("Disconnected\n");
   for(int i=0;i<MAX_UART_DEVICES;i++)
   {
+    /* Same guard as tud_suspend_cb, and it matters more here: these tasks are
+     * vTaskDelete()d below, and vTaskDelete() does not release the mutexes a
+     * task holds, so deleting a stranded holder of the UART hw lock would kill
+     * both UARTs for the whole power cycle. */
     if(uartDevices[i].isConfigured && uartDevices[i].uart_taskHandle != NULL)
-      vTaskSuspend(uartDevices[i].uart_taskHandle);
+      cdc_uart_suspend_thread(&uartDevices[i]);
   }
   /* Signal cooperative exit to all dap_threads. */
   for(int i=0;i<MAX_DAP_PROBES;i++)
