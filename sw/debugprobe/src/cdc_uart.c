@@ -299,10 +299,57 @@ void cdc_handle_profile_switch(struct CDCUartInstance_t* uart)
 }
 
 
+/* Programs the line coding the host last asked for.
+ * A dropped change is silent and permanent: TinyUSB answers GET_LINE_CODING from
+ * its own cached cdc_line_coding, so the host sees success and never learns that
+ * the UART is still running at the old rate. A change that loses the race for
+ * the hw lock is therefore kept pending and retried from cdc_uart_task, and the
+ * poll interval is only moved once the hardware really runs at the new rate.
+ * Returns false only when the lock was busy, i.e. "still pending, try later". */
+static bool cdc_uart_apply_line_coding(struct CDCUartInstance_t* uart)
+{
+  if(!uart->pendingLineCoding)
+    return true;
+
+  if(!lock_hw_uart(HW_UART_LOCK_TIMEOUT_TICKS))
+    return false;
+
+  /* Re-check under the lock: cdc_uart_line_coding_cb runs in tud_task and can
+   * have applied this same request while we waited for the lock. */
+  if(uart->pendingLineCoding)
+  {
+    /* A profile switch can have unbound this instance since the request
+     * arrived - uart_deinit(NULL) would resolve to uart0 and reset an unrelated
+     * block. There is no hardware to program then, so drop the request:
+     * cdc_uart_init() binds at the profile's own rate. */
+    if(cdc_uart_hw_live(uart))
+    {
+      uart_deinit(uart->uart);
+      uart_init(uart->uart, uart->pendingBitRate);
+      uart_set_format(uart->uart, uart->pendingDataBits, uart->pendingStopBits,
+                      (uart_parity_t)uart->pendingParity);
+
+      /* Only now does the poll interval match the rate the wire runs at. */
+      uart->interval = uart->pendingInterval;
+    }
+
+    uart->pendingLineCoding = false;
+  }
+
+  unlock_hw_uart();
+  return true;
+}
+
+
 bool cdc_uart_task(struct CDCUartInstance_t* uart)
 {
     // Profile switch
     cdc_handle_profile_switch(uart);
+
+    /* Retry a line coding change that could not take the hw lock when it
+     * arrived; a no-op when nothing is pending. Before the isUartInitialised
+     * check so a request left over from before an unbind is dropped there. */
+    cdc_uart_apply_line_coding(uart);
 
     // Ensure uart
     if(!uart->isUartInitialised)
@@ -448,9 +495,11 @@ void cdc_uart_line_coding_cb(struct CDCUartInstance_t* uart, uint8_t itf, cdc_li
    * fill up half a FIFO. Millis is too coarse for integer divide.
    */
   uint32_t micros = (1000 * 1000 * 16 * 10) / MAX(line_coding->bit_rate, 1);
-  uart->interval = MAX(1, micros / ((1000 * 1000) / configTICK_RATE_HZ));
+  /* Kept local: publishing it here would desync the poll loop from the real
+   * line rate whenever the hardware change below does not go through. */
+  TickType_t interval = MAX(1, micros / ((1000 * 1000) / configTICK_RATE_HZ));
   probe_info("New baud rate %ld micros %ld interval %lu\n",
-                  line_coding->bit_rate, micros, uart->interval);
+                  line_coding->bit_rate, micros, interval);
 
   tud_cdc_n_write_clear(uart->itf);
   tud_cdc_n_read_flush(uart->itf);
@@ -508,23 +557,21 @@ void cdc_uart_line_coding_cb(struct CDCUartInstance_t* uart, uint8_t itf, cdc_li
    * file takes - so nothing can touch the block while it is in reset between
    * uart_deinit() and uart_init().
    * Windows opens/reopens the port and re-sends line coding constantly, so this
-   * path must never be able to wedge tud_task: the wait is bounded and a failed
-   * take simply skips the reconfiguration (the host will set line coding again).
+   * path must never be able to wedge tud_task: the wait is bounded, and a failed
+   * take leaves the request pending for cdc_uart_task instead of dropping it -
+   * the host is only guaranteed to re-send line coding on reopen, so a dropped
+   * mid-session change would leave the UART at the old rate for good.
    */
-  if (lock_hw_uart(HW_UART_LOCK_TIMEOUT_TICKS))
-  {
-    /* Re-check under the lock: a profile switch can have unbound this instance
-     * since the unlocked isUartInitialised test in tud_cdc_line_coding_cb.
-     * uart_deinit(NULL) would resolve to uart0 and reset an unrelated block. */
-    if (cdc_uart_hw_live(uart))
-    {
-      uart_deinit(uart->uart);
-      uart_init(uart->uart, line_coding->bit_rate);
-      uart_set_format(uart->uart, data_bits, stop_bits, parity);
-    }
+  uart->pendingBitRate = line_coding->bit_rate;
+  uart->pendingInterval = interval;
+  uart->pendingDataBits = (uint8_t) data_bits;
+  uart->pendingStopBits = (uint8_t) stop_bits;
+  uart->pendingParity = (uint8_t) parity;
+  /* Published last: cdc_uart_thread runs at a higher priority than tud_task and
+   * must never act on a half written request. */
+  uart->pendingLineCoding = true;
 
-    unlock_hw_uart();
-  }
+  cdc_uart_apply_line_coding(uart);
 }
 
 

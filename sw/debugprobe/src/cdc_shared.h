@@ -78,6 +78,17 @@ typedef struct CDCUartInstance_t
     volatile TickType_t break_expiry;
     volatile bool timed_break;
 
+    /* Line coding the host asked for that is not programmed into the hardware
+     * yet (the hw lock was busy when it arrived). Retried from cdc_uart_task
+     * until it sticks: the host is never told that a change was dropped,
+     * because TinyUSB answers GET_LINE_CODING from its own cache. */
+    uint32_t pendingBitRate;
+    TickType_t pendingInterval;
+    uint8_t pendingDataBits;
+    uint8_t pendingStopBits;
+    uint8_t pendingParity;              /* uart_parity_t */
+    volatile bool pendingLineCoding;    /* published last */
+
     uint8_t tx_buf[32];    
     /* Bytes read out of the CDC FIFO but not yet pushed into the UART TX FIFO.
      * cdc_uart_task never blocks on the wire while holding the hw lock, so a
