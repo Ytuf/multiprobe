@@ -190,11 +190,15 @@ void probe_init(uint32_t probeId) {
         return;
 
     SemaphoreHandle_t mutex = pio_mutex[pio_get_index(probes[probeId].pio)];
-    if (mutex) xSemaphoreTake(mutex, portMAX_DELAY);
+    /* Give only if the take succeeded: a give from a non-owner clears
+     * xMutexHolder and corrupts the owner's uxMutexesHeld, silently, because
+     * configASSERT is compiled out in Release. A portMAX_DELAY take does fail if
+     * the task is suspended (tud_suspend_cb) while blocked on the mutex. */
+    bool locked = (mutex != NULL) && (xSemaphoreTake(mutex, portMAX_DELAY) == pdTRUE);
     // initted check inside mutex closes window vs concurrent probe_init/deinit on the same PIO.
     if (!probes[probeId].initted) {
         if (!pio_can_add_program(probes[probeId].pio, &probe_program)) {
-            if (mutex) xSemaphoreGive(mutex);
+            if (locked) xSemaphoreGive(mutex);
             probe_info("probe_init: PIO%d instruction memory exhausted, probe %d not initted\n",
                        pio_get_index(probes[probeId].pio), probeId);
             return;
@@ -214,14 +218,14 @@ void probe_init(uint32_t probeId) {
         pio_sm_set_enabled(probes[probeId].pio, probes[probeId].sm, 1);
         probes[probeId].initted = 1;
     }
-    if (mutex) xSemaphoreGive(mutex);
+    if (locked) xSemaphoreGive(mutex);
 }
 
 void probe_deinit(uint32_t probeId)
 {
   assert(probeId < MAX_DAP_PROBES);
   SemaphoreHandle_t mutex = pio_mutex[pio_get_index(probes[probeId].pio)];
-  if (mutex) xSemaphoreTake(mutex, portMAX_DELAY);
+  bool locked = (mutex != NULL) && (xSemaphoreTake(mutex, portMAX_DELAY) == pdTRUE);
   if (probes[probeId].initted) {
     probe_read_mode(probeId);
     pio_sm_set_enabled(probes[probeId].pio, probes[probeId].sm, 0);
@@ -232,7 +236,7 @@ void probe_deinit(uint32_t probeId)
     probe_gpio_deinit(probes[probeId].pio, probes[probeId].clkPin, probes[probeId].dioPin);
     probes[probeId].initted = 0;
   }
-  if (mutex) xSemaphoreGive(mutex);
+  if (locked) xSemaphoreGive(mutex);
 }
 
 void probe_led_init()

@@ -168,8 +168,10 @@ bool dap_edpt_xfer_cb(uint8_t __unused rhport, uint8_t ep_addr, xfer_result_t re
 	{
 		if(xferred_bytes >= 0u && xferred_bytes <= DAP_PACKET_SIZE)
 		{
-			if (state->ring_mutex != NULL)
-				xSemaphoreTake(state->ring_mutex, portMAX_DELAY);
+			/* Give only if the take succeeded - a give from a non-owner silently
+			 * corrupts the mutex (configASSERT is compiled out in Release). */
+			bool locked = (state->ring_mutex != NULL) &&
+			              (xSemaphoreTake(state->ring_mutex, portMAX_DELAY) == pdTRUE);
 
 			state->USBResponseBuffer.rptr++;
 
@@ -184,7 +186,7 @@ bool dap_edpt_xfer_cb(uint8_t __unused rhport, uint8_t ep_addr, xfer_result_t re
 				state->USBResponseBuffer.wasEmpty = (state->USBResponseBuffer.rptr + 1) == state->USBResponseBuffer.wptr;
 			}
 
-			if (state->ring_mutex != NULL)
+			if (locked)
 				xSemaphoreGive(state->ring_mutex);
 
 			// Handle can be NULL between unmount and next mount; xTaskNotifyGive(NULL) asserts.
@@ -199,8 +201,8 @@ bool dap_edpt_xfer_cb(uint8_t __unused rhport, uint8_t ep_addr, xfer_result_t re
 
 		if(xferred_bytes >= 0u && xferred_bytes <= DAP_PACKET_SIZE)
 		{
-			if (state->ring_mutex != NULL)
-				xSemaphoreTake(state->ring_mutex, portMAX_DELAY);
+			bool locked = (state->ring_mutex != NULL) &&
+			              (xSemaphoreTake(state->ring_mutex, portMAX_DELAY) == pdTRUE);
 
 			// Only queue the next buffer in the out callback if the buffer is not full
 			// If full, we set the wasFull flag, which will be checked by dap thread
@@ -214,7 +216,7 @@ bool dap_edpt_xfer_cb(uint8_t __unused rhport, uint8_t ep_addr, xfer_result_t re
 				state->USBRequestBuffer.wasFull = true;
 			}
 
-			if (state->ring_mutex != NULL)
+			if (locked)
 				xSemaphoreGive(state->ring_mutex);
 
 			if (state->dap_taskhandle != NULL)
@@ -269,12 +271,12 @@ void dap_thread(void *ptr)
 			// If the buffer was full in the out callback, we need to queue up another buffer for the endpoint to consume, now that we know there is space in the buffer.
 			if(state->USBRequestBuffer.wasFull)
 			{
-				if (state->ring_mutex != NULL)
-					xSemaphoreTake(state->ring_mutex, portMAX_DELAY);
+				bool locked = (state->ring_mutex != NULL) &&
+				              (xSemaphoreTake(state->ring_mutex, portMAX_DELAY) == pdTRUE);
 				state->USBRequestBuffer.wptr++;
 				usbd_edpt_xfer(state->_rhport, state->_out_ep_addr, WR_SLOT_PTR(state->USBRequestBuffer), DAP_PACKET_SIZE);
 				state->USBRequestBuffer.wasFull = false;
-				if (state->ring_mutex != NULL)
+				if (locked)
 					xSemaphoreGive(state->ring_mutex);
 			}
 
@@ -284,8 +286,8 @@ void dap_thread(void *ptr)
 					dap_cmd_string[DAPResponseBuffer[0]]);*/
 
 
-			if (state->ring_mutex != NULL)
-				xSemaphoreTake(state->ring_mutex, portMAX_DELAY);
+			bool respLocked = (state->ring_mutex != NULL) &&
+			                  (xSemaphoreTake(state->ring_mutex, portMAX_DELAY) == pdTRUE);
 
 			// Capture slot index before bumping wptr so IN cb sees matching resp_lens[].
 			uint32_t wr_slot = WR_IDX(state->USBResponseBuffer);
@@ -304,7 +306,7 @@ void dap_thread(void *ptr)
 				// The In callback needs to check this flag to know when to queue up the next buffer.
 				state->USBResponseBuffer.wasEmpty = false;
 			}
-			if (state->ring_mutex != NULL)
+			if (respLocked)
 				xSemaphoreGive(state->ring_mutex);
 		}
 
