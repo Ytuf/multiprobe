@@ -29,6 +29,7 @@
 #include "tusb.h"
 #include "get_serial.h"
 #include "probe_config.h"
+#include "usb_reset.h"
 
 //--------------------------------------------------------------------+
 // Device Descriptors
@@ -77,6 +78,11 @@ enum
   ITF_NUM_CDC_DATA,
   ITF_NUM_CDC1_COM,
   ITF_NUM_CDC1_DATA, 
+  /* Appended last on purpose: the MI_xx numbers of everything above are
+   * baked into Windows driver bindings and into the
+   * `cmsis-dap usb interface N` lines in openocd configs, so nothing
+   * above may be renumbered. */
+  ITF_NUM_RESET,
   ITF_NUM_TOTAL
 };
 
@@ -97,7 +103,26 @@ enum
 #define CDC1_DATA_OUT_EP_NUM       0x0e
 #define CDC1_DATA_IN_EP_NUM        0x8e
 
-#define CONFIG_TOTAL_LEN  (TUD_CONFIG_DESC_LEN + TUD_CDC_DESC_LEN + TUD_VENDOR_DESC_LEN + TUD_VENDOR_DESC_LEN + TUD_VENDOR_DESC_LEN + TUD_VENDOR_DESC_LEN + TUD_CDC_DESC_LEN)
+/* Raspberry Pi USB reset interface: a bare vendor-class interface
+ * descriptor, no endpoints. Not provided by TinyUSB - the pico-sdk defines
+ * it privately in pico_stdio_usb/stdio_usb_descriptors.c, so it is
+ * reproduced here. */
+#define TUD_RPI_RESET_DESC_LEN  9
+#define TUD_RPI_RESET_DESCRIPTOR(_itfnum, _stridx) \
+  /* Interface */\
+  9, TUSB_DESC_INTERFACE, _itfnum, 0, 0, TUSB_CLASS_VENDOR_SPECIFIC, RESET_INTERFACE_SUBCLASS, RESET_INTERFACE_PROTOCOL, _stridx
+
+#define CONFIG_TOTAL_LEN  (TUD_CONFIG_DESC_LEN + TUD_CDC_DESC_LEN + TUD_VENDOR_DESC_LEN + TUD_VENDOR_DESC_LEN + TUD_VENDOR_DESC_LEN + TUD_VENDOR_DESC_LEN + TUD_CDC_DESC_LEN + TUD_RPI_RESET_DESC_LEN)
+
+/* Byte offset of the second (ITF_NUM_CDC1_COM) CDC descriptor inside
+ * desc_configuration[]. Spelled out from the front rather than derived from
+ * CONFIG_TOTAL_LEN so that appending further descriptors cannot move it. */
+#define DESC_CDC1_OFFSET  (TUD_CONFIG_DESC_LEN + 4 * TUD_VENDOR_DESC_LEN + TUD_CDC_DESC_LEN)
+
+/* bmCapabilities of that CDC's Abstract Control Management functional
+ * descriptor: IAD(8) + interface(9) + header(5) + call management(5) + the
+ * first 4 bytes of the ACM descriptor. */
+#define DESC_CDC1_ACM_CAPS_OFFSET  (DESC_CDC1_OFFSET + 8 + 9 + 5 + 5 + 4 - 1)
 
 uint8_t desc_configuration[] =
 {
@@ -110,7 +135,15 @@ uint8_t desc_configuration[] =
   // Interface 1 + 2
   TUD_CDC_DESCRIPTOR(ITF_NUM_CDC_COM, 6, CDC_NOTIFICATION_EP_NUM, 64, CDC_DATA_OUT_EP_NUM, CDC_DATA_IN_EP_NUM, 64),
   TUD_CDC_DESCRIPTOR(ITF_NUM_CDC1_COM, 7, CDC1_NOTIFICATION_EP_NUM, 64, CDC1_DATA_OUT_EP_NUM, CDC1_DATA_IN_EP_NUM, 64),       
+  // Reset interface - no endpoints, control requests only (picotool -f)
+  TUD_RPI_RESET_DESCRIPTOR(ITF_NUM_RESET, 8),
 };
+
+/* Guards both CONFIG_TOTAL_LEN (reported in the configuration descriptor)
+ * and the DESC_CDC1_* offsets above against a descriptor being added,
+ * removed or resized. */
+TU_VERIFY_STATIC(sizeof(desc_configuration) == CONFIG_TOTAL_LEN, "Incorrect size");
+TU_VERIFY_STATIC(DESC_CDC1_OFFSET + TUD_CDC_DESC_LEN + TUD_RPI_RESET_DESC_LEN == CONFIG_TOTAL_LEN, "CDC1 offset stale");
 
 // Invoked when received GET CONFIGURATION DESCRIPTOR
 // Application return pointer to descriptor
@@ -118,8 +151,13 @@ uint8_t desc_configuration[] =
 uint8_t const * tud_descriptor_configuration_cb(uint8_t index)
 {
   (void) index; // for multiple configurations
-  /* Hack in CAP_BREAK support */
-  desc_configuration[CONFIG_TOTAL_LEN - TUD_CDC_DESC_LEN + 8 + 9 + 5 + 5 + 4 - 1] = 0x6;
+  /* Hack in CAP_BREAK support.
+   * This used to read CONFIG_TOTAL_LEN - TUD_CDC_DESC_LEN + ..., i.e. it
+   * assumed the last CDC descriptor was also the last thing in the array.
+   * The reset interface now follows it, so the offset is taken from the
+   * front instead; measured from the end it would land on bmAttributes of
+   * CDC1's notification endpoint. */
+  desc_configuration[DESC_CDC1_ACM_CAPS_OFFSET] = 0x6;
   return desc_configuration;
 }
 
@@ -138,6 +176,7 @@ char const* string_desc_arr [] =
   "CMSIS-DAP v2 Interface", // 5: Interface descriptor for Bulk transport
   "CDC-ACM UART Interface", // 6: Interface descriptor for CDC
   "Custom CDC-ACM UART Interface", // 6: Interface descriptor for CDC
+  "Reset", // 8: Interface descriptor for the Raspberry Pi USB reset interface
 };
 
 static uint16_t _desc_str[32];
@@ -196,7 +235,9 @@ will insert "DeviceInterfaceGUIDs" multistring property.
 https://developers.google.com/web/fundamentals/native-hardware/build-for-webusb/
 (Section Microsoft OS compatibility descriptors)
 */
-#define MS_OS_20_DESC_LEN  658
+/* 10 (set header) + 8 (configuration subset header)
+ * + 4 * 160 (CMSIS-DAP function subsets) + 156 (reset function subset) */
+#define MS_OS_20_DESC_LEN  814
 
 #define BOS_TOTAL_LEN      (TUD_BOS_DESC_LEN + TUD_BOS_MICROSOFT_OS_DESC_LEN)
 
@@ -292,6 +333,30 @@ uint8_t const desc_ms_os_20[] =
     'E', 0x00, 'D', 0x00, 'A', 0x00, 'F', 0x00, '-', 0x00, '4', 0x00, '7', 0x00, 'D', 0x00, '5', 0x00, '-', 0x00,
     '9', 0x00, '2', 0x00, 'C', 0x00, '8', 0x00, '-', 0x00, '7', 0x00, 'C', 0x00, 'B', 0x00, '5', 0x00, '1', 0x00,
     '1', 0x00, '0', 0x00, '2', 0x00, '0', 0x00, '3', 0x00, '0', 0x00, '6', 0x00, '}', 0x00, 0x00, 0x00, 0x00, 0x00,    
+
+    /* Reset interface. Without a WinUSB compatible ID here Windows leaves
+     * MI_08 driverless and libusb (hence picotool) cannot claim it.
+     * Byte-for-byte the subset pico_stdio_usb publishes, DeviceInterfaceGUID
+     * included, so the interface looks identical to a stock Pico's. */
+
+    // Function Subset header: length, type, first interface, reserved, subset length
+    U16_TO_U8S_LE(0x0008), U16_TO_U8S_LE(MS_OS_20_SUBSET_HEADER_FUNCTION), ITF_NUM_RESET, 0, U16_TO_U8S_LE(0x08 + 0x14 + 0x80),
+
+    // MS OS 2.0 Compatible ID descriptor: length, type, compatible ID, sub compatible ID
+    U16_TO_U8S_LE(0x0014), U16_TO_U8S_LE(MS_OS_20_FEATURE_COMPATBLE_ID), 'W', 'I', 'N', 'U', 'S', 'B', 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // sub-compatible
+
+    // MS OS 2.0 Registry property descriptor: length, type
+    U16_TO_U8S_LE(0x0080), U16_TO_U8S_LE(MS_OS_20_FEATURE_REG_PROPERTY),
+    U16_TO_U8S_LE(0x0001), U16_TO_U8S_LE(0x0028), // wPropertyDataType, wPropertyNameLength and PropertyName "DeviceInterfaceGUID" in UTF-16
+    'D', 0x00, 'e', 0x00, 'v', 0x00, 'i', 0x00, 'c', 0x00, 'e', 0x00, 'I', 0x00, 'n', 0x00, 't', 0x00, 'e', 0x00,
+    'r', 0x00, 'f', 0x00, 'a', 0x00, 'c', 0x00, 'e', 0x00, 'G', 0x00, 'U', 0x00, 'I', 0x00, 'D', 0x00, 0x00, 0x00,
+    U16_TO_U8S_LE(0x004E), // wPropertyDataLength
+    //bPropertyData: {bc7398c1-73cd-4cb7-98b8-913a8fca7bf6}
+    '{', 0x00, 'b', 0x00, 'c', 0x00, '7', 0x00, '3', 0x00, '9', 0x00, '8', 0x00, 'c', 0x00, '1', 0x00, '-', 0x00,
+    '7', 0x00, '3', 0x00, 'c', 0x00, 'd', 0x00, '-', 0x00, '4', 0x00, 'c', 0x00, 'b', 0x00, '7', 0x00, '-', 0x00,
+    '9', 0x00, '8', 0x00, 'b', 0x00, '8', 0x00, '-', 0x00, '9', 0x00, '1', 0x00, '3', 0x00, 'a', 0x00, '8', 0x00,
+    'f', 0x00, 'c', 0x00, 'a', 0x00, '7', 0x00, 'b', 0x00, 'f', 0x00, '6', 0x00, '}', 0x00, 0x00, 0x00,
 };
 
 TU_VERIFY_STATIC(sizeof(desc_ms_os_20) == MS_OS_20_DESC_LEN, "Incorrect size");

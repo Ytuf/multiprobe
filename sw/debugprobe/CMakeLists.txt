@@ -39,6 +39,7 @@ add_executable(debugprobe
         src/probe_config.c
         src/main.c
         src/usb_descriptors.c
+        src/usb_reset.c
         src/probe.c
         src/cdc_uart.c
         src/get_serial.c
@@ -98,6 +99,9 @@ target_link_libraries(debugprobe PRIVATE
         tinyusb_board
         hardware_pio
         hardware_i2c
+        hardware_watchdog          # watchdog_reboot() for RESET_REQUEST_FLASH
+        pico_bootrom               # reset_usb_boot() for RESET_REQUEST_BOOTSEL
+        pico_usb_reset_interface_headers
         FreeRTOS-Kernel
         FreeRTOS-Kernel-Heap1
 )

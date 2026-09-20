@@ -47,6 +47,7 @@ void cdc_activate_profile( int uartId, int profileId );
 #include "cdc_uart.h"
 #include "get_serial.h"
 #include "tusb_edpt_handler.h"
+#include "usb_reset.h"
 #include "DAP.h"
 #include "hardware/structs/usb.h"
 #include "semphr.h"
@@ -178,7 +179,10 @@ int main(void)
 #if (PROBE_DEBUG_PROTOCOL == PROTO_DAP_V2)
 extern uint8_t const desc_ms_os_20[];
 
-bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_request_t const * request)
+/* Unchanged WebUSB / MS OS 2.0 handler. It is no longer the callback itself:
+ * tud_vendor_control_xfer_cb() below offers the request to the USB reset
+ * interface first and falls through to here. */
+static bool webusb_ms_os_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_request_t const * request)
 {
   // nothing to with DATA & ACK stage
   if (stage != CONTROL_STAGE_SETUP) return true;
@@ -212,6 +216,36 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_requ
   return false;
 }
 #endif
+
+/* TinyUSB 0.18 short-circuits *every* TUSB_REQ_TYPE_VENDOR control request
+ * straight to this callback in process_control_request(), before any class
+ * driver is consulted, so the reset interface has to be offered vendor-type
+ * requests here rather than only in its class driver.
+ *
+ * picotool sends the reset requests as LIBUSB_REQUEST_TYPE_CLASS |
+ * LIBUSB_RECIPIENT_INTERFACE, which TinyUSB routes to the class driver that
+ * owns the interface (resetd_control_xfer_cb in usb_reset.c), so this link of
+ * the chain only matters for a host that uses the vendor request type.
+ *
+ * The two links never fight over a request: usb_reset_handle_request() claims
+ * only wIndex == ITF_NUM_RESET (8) with bRequest 1 or 2, while the MS OS 2.0
+ * descriptor request is bRequest == 1 with wIndex == 7 (MS_OS_20_DESCRIPTOR_INDEX,
+ * a descriptor index and not an interface number). */
+bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_request_t const * request)
+{
+  // nothing to with DATA & ACK stage
+  if (stage != CONTROL_STAGE_SETUP) return true;
+
+  if (request->bmRequestType_bit.type == TUSB_REQ_TYPE_VENDOR &&
+      usb_reset_handle_request(rhport, stage, request))
+    return true;
+
+#if (PROBE_DEBUG_PROTOCOL == PROTO_DAP_V2)
+  return webusb_ms_os_control_xfer_cb(rhport, stage, request);
+#else
+  return false;
+#endif
+}
 
 void tud_suspend_cb(bool remote_wakeup_en)
 {

@@ -7,6 +7,7 @@
 #include "tusb_edpt_handler.h"
 #include "DAP.h"
 #include "probe.h"  // probe_deinit() for cooperative-exit HiZ on cable yank
+#include "usb_reset.h"
 
 #define WR_IDX(x) (x.wptr % DAP_PACKET_COUNT)
 #define RD_IDX(x) (x.rptr % DAP_PACKET_COUNT)
@@ -494,11 +495,24 @@ usbd_class_driver_t const _dap_edpt_driver =
 #endif
 };
 
-// Add the custom driver to the tinyUSB stack
+// Add the custom drivers to the tinyUSB stack.
+//
+// Order matters only in that both are tried ahead of TinyUSB's built-in
+// vendor class driver; the two open() filters are disjoint (subclass 0 /
+// protocol 0 for CMSIS-DAP, subclass 0 / protocol 1 for the reset interface).
 usbd_class_driver_t const *usbd_app_driver_get_cb(uint8_t *driver_count)
 {
-	*driver_count = 1;
-	return &_dap_edpt_driver;
+	/* Built at run time: _dap_edpt_driver and usb_reset_driver live in
+	 * different translation units, so a file-scope aggregate initialiser
+	 * copying them is not a constant expression. tud_init() calls this once
+	 * and keeps the pointer, so one fill of static storage is enough. */
+	static usbd_class_driver_t app_drivers[2];
+
+	app_drivers[0] = _dap_edpt_driver;
+	app_drivers[1] = usb_reset_driver;
+
+	*driver_count = TU_ARRAY_SIZE(app_drivers);
+	return app_drivers;
 }
 
 /*void dap_close_all(void) {
