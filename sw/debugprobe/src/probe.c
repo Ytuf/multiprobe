@@ -208,6 +208,12 @@ void probe_init(uint32_t probeId) {
                        pio_get_index(probes[probeId].pio), probeId);
             return;
         }
+        // Reclaim the pins. probe_deinit hands them back with gpio_deinit (CMSIS-DAP
+        // wants SWCLK/SWDIO Hi-Z while disconnected), which detaches them from the PIO;
+        // they were only ever claimed by DAP_SETUP at boot. Without this every session
+        // after the first clocked SWD into unconnected pads and read junk ACKs.
+        probe_gpio_init(probes[probeId].pio, probes[probeId].clkPin, probes[probeId].dioPin);
+
         uint offset = pio_add_program(probes[probeId].pio, &probe_program);
         probes[probeId].offset = offset;
 
